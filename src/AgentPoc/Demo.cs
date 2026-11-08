@@ -381,6 +381,8 @@ public static class Demo
         var subagentSuspendedDurably = false;
         HumanRequest? discarded = null;
         string? discardedRunStatus = null;
+        HumanRequest? usedApproval = null;
+        var usedApprovalReconsumed = true;
 
         s.Checks.Add(new Check("ask_human suspendeu o run (waiting_human) sem segurar processo",
             _ => suspended.TryGetValue("pergunta", out var w) && w.Status == "waiting_human" && w.WaitingFor != null));
@@ -405,6 +407,8 @@ public static class Demo
                  results.TryGetValue("seguiu", out var r) && r.Status == "completed"));
         s.Checks.Add(new Check("Toda decisao ficou registrada em approvals com quem/como foi decidida",
             _ => decided.Count >= 4 && decided.Values.All(r => r.Status != "pending" && r.Reason != null || r.Answer != null)));
+        s.Checks.Add(new Check("Aprovacao vale para uma unica execucao: depois de usada nao autoriza outra chamada identica",
+            _ => usedApproval?.ConsumedAt != null && !usedApprovalReconsumed));
 
         async Task<RunResult> Send(string key, string text)
         {
@@ -434,6 +438,8 @@ public static class Demo
 
         await Send("editar", "liste os arquivos usando o shell");
         await Decide(app, "editar", new HumanDecision(true, "quero ver detalhes", new System.Text.Json.Nodes.JsonObject { ["command"] = "ls -la" }, null));
+        usedApproval = await app.Chat.Human.GetAsync(decided["editar"].Id);
+        usedApprovalReconsumed = await app.Chat.Human.TryConsumeAsync(decided["editar"].Id);
 
         await Send("negar", "liste os arquivos usando o shell");
         await Decide(app, "negar", new HumanDecision(false, "agora nao, estou em auditoria", null, null));

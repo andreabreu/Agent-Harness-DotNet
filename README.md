@@ -90,6 +90,7 @@ dotnet run -- dispatcher           # instancia so de retomada (escala horizontal
 | Negar com motivo | O motivo volta para o agente como resultado da ferramenta, e ele replaneja |
 | Pergunta do agente | `ask_human(question, options)`: o agente pergunta no meio da tarefa e continua com a resposta |
 | Regras por argumento | `tools.config`: `deny_when` bloqueia sem perguntar (ex.: `rm -rf`, `sudo`); `approval_when` exige aprovacao (ex.: `http_get` em URL interna) |
+| Uma decisao, uma execucao | A decisao vale so para a mesma ferramenta com os mesmos argumentos e e marcada como usada (`approvals.consumed_at`) ao ser aplicada; uma chamada identica depois (ids como `call_0` se repetem em modelos locais) gera um pedido novo |
 
 **Espera duravel em toda a cadeia, so com Postgres.** Nenhuma espera humana fica em memoria:
 
@@ -275,6 +276,10 @@ Com a execucao duravel: 12 cenarios, 76/76 checagens (inclui `durabilidade_entre
 da transacao de entrega e reconciliacao); `tests/run_restart.sh` com `kill -9` de verdade (chamada lenta
 recuperada por outra instancia; `run_shell` interrompido nao repete e vira pergunta; dois processos
 `dispatcher` disputando orfaos sem duplicar). Testes unitarios: 71.
+
+Com aprovacao de uso unico: 12 cenarios, 77/77 checagens (com `SEARXNG_URL` apontando para o dublê; com
+busca real, o tamanho dos resultados muda o ponto de compactacao do `chat` e a checagem do resumo pode
+falhar); `tests/run_restart.sh` e `tests/hitl_restart.sh` OK. Testes unitarios: 74.
 
 Nao testado: contra o Azure Foundry real (inclusive `stream_options` e `reasoning_effort` no deployment)
 e a Brave Search API. O primeiro `dotnet run -- check` com o `.env` preenchido confirma o modelo.

@@ -24,19 +24,18 @@ public sealed class DurableHumanGate : IHumanGate
 
     public async Task<ApprovalDecision> ApproveAsync(RunContext ctx, string toolCallId, string tool, JsonObject args, string policyReason, CancellationToken ct)
     {
-        var request = SameCall(await _store.FindAsync(ctx.RunId, toolCallId), tool, args);
-        if (request == null)
+        var request = Reusable(await _store.FindAsync(ctx.RunId, toolCallId), tool, args);
+        if (request is { Status: "pending" })
+            throw new HumanInputRequiredException(request.Id, toolCallId, $"aprovacao de {tool}");
+        if (request == null || !await _store.TryConsumeAsync(request.Id))
         {
             var id = await _store.CreateApprovalAsync(ctx.RunId, ctx.ConversationId, toolCallId, tool, args, policyReason, _expiresIn);
             await AnnounceAsync(ctx, id, "approval", new JsonObject { ["tool"] = tool, ["args"] = args.DeepClone(), ["policy_reason"] = policyReason });
             throw new HumanInputRequiredException(id, toolCallId, $"aprovacao de {tool}");
         }
-        return request.Status switch
-        {
-            "approved" => new ApprovalDecision(true, request.Reason ?? "aprovado pela pessoa", request.EditedArgs),
-            "pending" => throw new HumanInputRequiredException(request.Id, toolCallId, $"aprovacao de {tool}"),
-            _ => new ApprovalDecision(false, request.Reason ?? $"pedido {request.Status}")
-        };
+        return request.Status == "approved"
+            ? new ApprovalDecision(true, request.Reason ?? "aprovado pela pessoa", request.EditedArgs)
+            : new ApprovalDecision(false, request.Reason ?? $"pedido {request.Status}");
     }
 
     public async Task<string> AskAsync(RunContext ctx, string toolCallId, string question, IReadOnlyList<string> options, CancellationToken ct)
@@ -63,11 +62,13 @@ public sealed class DurableHumanGate : IHumanGate
     }
 
     /// <summary>
-    /// A decisao so vale para a mesma ferramenta com os mesmos argumentos. Ids de tool call podem se repetir
-    /// (modelos locais geram "call_0"); sem esta checagem uma chamada nova herdaria uma aprovacao antiga.
+    /// A decisao so vale para a mesma ferramenta, com os mesmos argumentos, e para uma unica execucao. Ids de tool
+    /// call podem se repetir (modelos locais geram "call_0"); sem isso uma chamada nova identica herdaria a aprovacao
+    /// de uma anterior.
     /// </summary>
-    private static HumanRequest? SameCall(HumanRequest? request, string tool, JsonObject args) =>
-        request != null && request.Kind == "approval" && request.Tool == tool && JsonNode.DeepEquals(request.Args, args) ? request : null;
+    public static HumanRequest? Reusable(HumanRequest? request, string tool, JsonObject args) =>
+        request != null && request.Kind == "approval" && request.ConsumedAt == null && request.Tool == tool &&
+        JsonNode.DeepEquals(request.Args, args) ? request : null;
 
     private Task AnnounceAsync(RunContext ctx, Guid id, string kind, JsonObject data)
     {

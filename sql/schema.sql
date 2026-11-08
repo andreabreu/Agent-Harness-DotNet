@@ -274,3 +274,4 @@ create index if not exists ix_approvals_pending on approvals(conversation_id) wh
 create index if not exists ix_approvals_call on approvals(run_id, tool_call_id);
 alter table approvals add column if not exists expires_at timestamptz;
 create index if not exists ix_approvals_expiring on approvals(expires_at) where status = 'pending';
+alter table approvals add column if not exists consumed_at timestamptz;  -- decisao ja usada por uma execucao; nao vale para outra
