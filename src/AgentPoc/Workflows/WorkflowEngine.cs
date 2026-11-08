@@ -31,20 +31,26 @@ public sealed class WorkflowEngine
         _runner = runner;
     }
 
-    public async Task<WorkflowResult> RunAsync(string workflowId, string? input, Guid? resumeRunId = null, string? crashAfter = null, CancellationToken ct = default)
+    /// <param name="approval">Modo de aprovacao da execucao; nulo nega (padrao) ou, na retomada, mantem o gravado.</param>
+    public async Task<WorkflowResult> RunAsync(string workflowId, string? input, Guid? resumeRunId = null, string? crashAfter = null,
+                                               WorkflowApprovalMode? approval = null, CancellationToken ct = default)
     {
         Guid wfRunId;
         string wfInput;
+        JsonObject definition;
         var outputs = new Dictionary<string, string>(StringComparer.Ordinal);
         var reused = new List<string>();
 
         if (resumeRunId is Guid rid)
         {
-            var run = await _db.QueryOneAsync("select workflow_id, input, status from workflow_runs where id = @id", ("id", rid))
+            var run = await _db.QueryOneAsync(
+                          "select workflow_id, input, status, approval_mode, approval_mode_explicit from workflow_runs where id = @id", ("id", rid))
                       ?? throw new InvalidOperationException($"workflow run {rid} nao encontrado.");
             workflowId = run.S("workflow_id");
             wfInput = run.S("input");
             wfRunId = rid;
+            approval = await ResumedApprovalAsync(rid, run, approval);
+            definition = await LoadDefinitionAsync(workflowId);
             foreach (var n in await _db.QueryAsync("select node_id, output from workflow_node_runs where workflow_run_id = @id and status = 'completed'", ("id", rid)))
             {
                 outputs[n.S("node_id")] = n.S("output");
@@ -56,17 +62,22 @@ public sealed class WorkflowEngine
         else
         {
             wfInput = input ?? "";
+            approval ??= WorkflowApprovalMode.Default;
             var version = await _db.ScalarAsync("select version from workflows where id = @id and enabled", ("id", workflowId))
                           ?? throw new InvalidOperationException($"Workflow '{workflowId}' nao existe ou esta desabilitado.");
+            definition = await LoadDefinitionAsync(workflowId);
+            await EnsureToolRulesMatchRegisteredToolsAsync(workflowId, WorkflowToolRules.Parse(definition));
             wfRunId = (Guid)(await _db.ScalarAsync(
-                "insert into workflow_runs (workflow_id, workflow_version, input) values (@w, @v, @i) returning id",
-                ("w", workflowId), ("v", Convert.ToInt32(version)), ("i", wfInput)))!;
+                @"insert into workflow_runs (workflow_id, workflow_version, input, approval_mode, approval_mode_explicit)
+                  values (@w, @v, @i, @mode, @explicit) returning id",
+                ("w", workflowId), ("v", Convert.ToInt32(version)), ("i", wfInput), ("mode", approval.Mode), ("explicit", approval.Explicit)))!;
             Log.Info($"Workflow '{workflowId}' v{version} iniciado: run {Text.Short(wfRunId)}");
         }
+        Log.Info($"aprovacao: {approval.Describe()}");
+        var gate = approval.Gate();
+        var rules = WorkflowToolRules.Parse(definition);
 
-        var defJson = (string?)await _db.ScalarAsync("select definition::text from workflows where id = @id", ("id", workflowId))
-                      ?? throw new InvalidOperationException($"Workflow '{workflowId}' sem definicao.");
-        var nodes = (JsonNode.Parse(defJson) as JsonObject)?["nodes"] as JsonObject
+        var nodes = definition["nodes"] as JsonObject
                     ?? throw new InvalidOperationException("Definicao de workflow invalida: falta 'nodes'.");
 
         var preds = nodes.ToDictionary(kv => kv.Key, _ => new List<string>(), StringComparer.Ordinal);
@@ -90,7 +101,7 @@ public sealed class WorkflowEngine
                 if (ready.Count == 0) throw new InvalidOperationException("Workflow sem progresso possivel (ciclo nas arestas?).");
                 Log.Write(0, ConsoleColor.Blue, "workflow", ready.Count > 1 ? $"executando em paralelo: {string.Join(" || ", ready)}" : $"executando no: {ready[0]}");
 
-                var results = await Task.WhenAll(ready.Select(n => RunNodeAsync(wfRunId, n, (JsonObject)nodes[n]!, wfInput, outputs, ct)));
+                var results = await Task.WhenAll(ready.Select(n => RunNodeAsync(wfRunId, n, (JsonObject)nodes[n]!, wfInput, outputs, gate, rules, ct)));
                 var failed = results.Where(x => !x.Ok).ToList();
                 foreach (var res in results.Where(x => x.Ok))
                 {
@@ -148,7 +159,36 @@ public sealed class WorkflowEngine
         _ => node?.DeepClone()
     };
 
-    private async Task<NodeResult> RunNodeAsync(Guid wfRunId, string nodeId, JsonObject node, string input, IReadOnlyDictionary<string, string> outputs, CancellationToken ct)
+    private async Task<JsonObject> LoadDefinitionAsync(string workflowId)
+    {
+        var json = (string?)await _db.ScalarAsync("select definition::text from workflows where id = @id", ("id", workflowId))
+                   ?? throw new InvalidOperationException($"Workflow '{workflowId}' sem definicao.");
+        return JsonNode.Parse(json) as JsonObject ?? throw new InvalidOperationException($"Definicao do workflow '{workflowId}' nao e um objeto JSON.");
+    }
+
+    private async Task EnsureToolRulesMatchRegisteredToolsAsync(string workflowId, WorkflowToolRules? rules)
+    {
+        if (rules == null) return;
+        var registered = (await _db.QueryAsync("select name from tools")).Select(r => r.S("name"));
+        var unmatched = rules.UnmatchedPatterns(registered);
+        if (unmatched.Length > 0)
+            throw new InvalidOperationException(
+                $"Workflow '{workflowId}' nao iniciado: regras de ferramenta sem correspondencia no registro: {string.Join(", ", unmatched)}.");
+    }
+
+    /// <summary>Retomada mantem o modo gravado; um modo explicito novo substitui e fica registrado.</summary>
+    private async Task<WorkflowApprovalMode> ResumedApprovalAsync(Guid wfRunId, Dictionary<string, object?> run, WorkflowApprovalMode? requested)
+    {
+        var stored = run.SN("approval_mode") is { } mode ? new WorkflowApprovalMode(mode, run.B("approval_mode_explicit")) : WorkflowApprovalMode.Default;
+        if (requested is not { Explicit: true } || requested == stored) return stored;
+        await _db.ExecAsync("update workflow_runs set approval_mode = @mode, approval_mode_explicit = true where id = @id",
+            ("mode", requested.Mode), ("id", wfRunId));
+        Log.Warn($"Retomada troca o modo de aprovacao de {stored.Describe()} para {requested.Describe()}.");
+        return requested;
+    }
+
+    private async Task<NodeResult> RunNodeAsync(Guid wfRunId, string nodeId, JsonObject node, string input, IReadOnlyDictionary<string, string> outputs,
+                                                IHumanGate gate, WorkflowToolRules? rules, CancellationToken ct)
     {
         await _db.ExecAsync(
             @"insert into workflow_node_runs (workflow_run_id, node_id, status) values (@w, @n, 'running')
@@ -163,7 +203,7 @@ public sealed class WorkflowEngine
         if (type == "agent")
         {
             var prompt = Render(HttpTool.ArgString(node["input"]), input, outputs);
-            var r = await _runner.RunAsync(HttpTool.ArgString(node["agent"]), prompt, workflowRunId: wfRunId, ct: ct);
+            var r = await _runner.RunAsync(HttpTool.ArgString(node["agent"]), prompt, workflowRunId: wfRunId, hooks: new RunHooks(null, gate, rules), ct: ct);
             ok = r.Status == "completed";
             output = r.Output;
             runId = r.RunId;
@@ -171,7 +211,7 @@ public sealed class WorkflowEngine
         else if (type == "tool")
         {
             var args = RenderNode(node["args"], input, outputs) as JsonObject ?? new JsonObject();
-            var r = await _runner.RunToolAsync(HttpTool.ArgString(node["tool"]), args, wfRunId, ct);
+            var r = await _runner.RunToolAsync(HttpTool.ArgString(node["tool"]), args, wfRunId, gate, rules, ct);
             ok = r.Ok;
             output = r.Output;
             runId = r.RunId;

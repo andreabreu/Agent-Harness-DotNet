@@ -201,6 +201,11 @@ create table if not exists workflow_runs (
     started_at   timestamptz not null default now(),
     finished_at  timestamptz
 );
+alter table workflow_runs add column if not exists approval_mode text;                -- deny | auto | ask; nulo em execucoes antigas = deny
+alter table workflow_runs add column if not exists approval_mode_explicit boolean not null default false;
+alter table workflow_runs drop constraint if exists workflow_runs_approval_mode_check;
+alter table workflow_runs add constraint workflow_runs_approval_mode_check
+    check (approval_mode in ('deny', 'auto', 'ask'));
 
 create table if not exists workflow_node_runs (
     workflow_run_id uuid not null references workflow_runs(id),

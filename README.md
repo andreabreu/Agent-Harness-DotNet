@@ -140,8 +140,8 @@ API usada pela tela (sem autenticacao; escuta so em localhost):
 | `check` | valida o `.env` e testa tool calling em cada modelo usado pelos agentes |
 | `agents` / `tools` | mostra a configuracao lida do banco |
 | `task <agente> "<texto>"` | roda um agente; pede aprovacao no terminal para ferramentas `approval` |
-| `workflow <id> "<entrada>" [--crash-after <no>]` | roda um workflow (opcionalmente simulando queda) |
-| `workflow --resume <workflow_run_id>` | retoma um workflow a partir dos checkpoints |
+| `workflow <id> "<entrada>" [--crash-after <no>] [--approval deny\|auto\|ask]` | roda um workflow (opcionalmente simulando queda); sem modo informado, nega ferramentas de aprovacao |
+| `workflow --resume <workflow_run_id> [--approval ...]` | retoma um workflow a partir dos checkpoints, com o modo de aprovacao gravado na execucao |
 | `worker [--concurrency N] [--once]` | processa a fila de tarefas assincronas |
 | `sync-mcp` | importa as tools dos servidores MCP habilitados |
 | `demo [cenario\|all]` | roda os cenarios de demonstracao com checagens automaticas |
@@ -164,6 +164,7 @@ Opcoes: `--approval auto|deny|ask`, `--budget <tokens>`.
 | `hitl_expira` | Pedido vencido: negado como `expired`, o subagente replaneja e o pai termina |
 | `hitl_cancela` | Cancelar o raiz com subagente suspenso: toda a cadeia `cancelled`, pedido fechado, nada retomado |
 | `durabilidade_entrega` | Queda injetada (`AGENTPOC_FAULT`) dentro da transacao que conclui o filho e acorda o pai: nada fica pela metade, o lease vence, o filho e recuperado sem chamar o modelo de novo e o pai termina com um unico `tool_result`; pai preso forjado no banco e corrigido pela reconciliacao |
+| `workflow_aprovacao` | Workflow sem modo informado nega `run_shell` (no de ferramenta e subagente), modo `auto` explicito executa, `tools.allow` libera, `tools.block` bloqueia ferramenta `auto`, `deny_when` vence o `allow`, regra com ferramenta inexistente impede o inicio; cada decisao grava a origem |
 | `chat` | Conversa de 5 turnos: pesquisa na web, plano + delegacao, resposta pelo historico, aprovacao negada, ferramentas persistidas, streaming e compactacao em resumo |
 
 ## Como funciona
@@ -200,7 +201,15 @@ sql/schema.sql, seed.sql    tudo que define comportamento
   que e uma fatia do saldo do pai (consumo do filho desconta do pai); profundidade maxima 3.
   `create_task` faz a versao assincrona, via fila.
 - **Politicas**: cada ferramenta tem `policy` = `auto`, `approval` ou `deny`, refinada por regras por
-  argumento (`deny_when`, `approval_when`). Toda decisao fica auditada.
+  argumento (`deny_when`, `approval_when`). Toda decisao fica auditada, com a origem no campo `source` do evento
+  `policy` (`tool_policy`, `deny_when`, `approval_when`, `workflow_block`, `workflow_allow`, `human`,
+  `mode_default`, `mode_explicit`).
+- **Aprovacao em workflow**: cada execucao tem o proprio modo (`--approval` ou `APPROVAL_MODE`; sem nenhum dos
+  dois, `deny`, porque nao ha quem responda). O modo fica em `workflow_runs.approval_mode` e vale para nos de
+  agente, seus subagentes e nos de ferramenta; o `--resume` usa o gravado. A definicao pode ter
+  `"tools": {"allow": [...], "block": [...]}` (curingas como em `allowed_tools`). Precedencia: `deny` global >
+  `deny_when` > `block` > `approval_when` > `allow` > politica da ferramenta; `allow` so dispensa a politica
+  `approval`. Padrao sem ferramenta correspondente impede o inicio.
 - **Suspensao duravel**: um run pode parar sem processo preso (`waiting_human`, `waiting_child`), com todo o
   historico no banco. Qualquer instancia com o despachante retoma o mesmo run quando ele fica `ready`.
   Estados: `running` -> `waiting_human` | `waiting_child` -> `ready` -> `running` -> `completed`/... ;
@@ -281,6 +290,11 @@ Com aprovacao de uso unico: 12 cenarios, 77/77 checagens (com `SEARXNG_URL` apon
 busca real, o tamanho dos resultados muda o ponto de compactacao do `chat` e a checagem do resumo pode
 falhar); `tests/run_restart.sh` e `tests/hitl_restart.sh` OK. Testes unitarios: 74.
 
+Com aprovacao segura em workflows (spec 001): 13 cenarios, 86/86 checagens (inclui `workflow_aprovacao`, 9/9,
+com o modo global da CLI em `auto` de proposito); `tests/run_restart.sh` e `tests/hitl_restart.sh` OK;
+`workflow` na linha de comando sem modo (nega), com `--approval auto` (executa) e com `APPROVAL_MODE` invalido
+(erro, codigo 1). Testes unitarios: 99.
+
 Nao testado: contra o Azure Foundry real (inclusive `stream_options` e `reasoning_effort` no deployment)
 e a Brave Search API. O primeiro `dotnet run -- check` com o `.env` preenchido confirma o modelo.
 
@@ -304,8 +318,13 @@ e a Brave Search API. O primeiro `dotnet run -- check` com o `.env` preenchido c
   pequena em que uma instancia que acabou de perder o lease grava uma ultima mensagem.
 - Texto token a token so aparece quando o run executa no mesmo processo que serve a tela; de outra instancia,
   por mensagem completa. O stream da tela le o banco a cada 250 ms.
-- Tarefas da fila (`worker`) e nos de workflow ainda nao esperam pessoa: usam o modo de aprovacao da CLI
-  (`APPROVAL_MODE`, padrao `auto` no `serve`).
+- Tarefas da fila (`worker`) e nos de workflow ainda nao esperam pessoa. A fila usa o modo de aprovacao da CLI
+  (`APPROVAL_MODE`, padrao `auto` no `serve`); o workflow usa o modo da execucao, padrao `deny`.
+- As regras `tools.allow`/`tools.block` vem da definicao atual do workflow, inclusive no `--resume` (a definicao
+  nao e fixada por execucao); nem elas nem o modo sao gravados no run do agente. Quando um no puder esperar uma
+  pessoa de forma duravel, o run retomado precisara recebe-los.
+- `tools.allow` nao supera `approval_when`: um `http_get` liberado para uma URL interna continua pedindo
+  aprovacao (e e negado no modo padrao).
 - Sem autenticacao, nao ha registro de QUEM decidiu nem aprovador por papel/notificacao (Teams, e-mail).
 - DuckDuckGo Lite e raspagem de HTML e pode limitar por excesso de uso; em producao use SearXNG ou uma API.
 - O MCP suporta so stdio e so tools (sem resources, prompts nem HTTP/SSE).

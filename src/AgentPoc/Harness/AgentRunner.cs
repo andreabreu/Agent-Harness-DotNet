@@ -89,7 +89,8 @@ public sealed class AgentRunner
             Depth = depth,
             Budget = budget,
             Observer = hooks?.Observer ?? parent?.Observer,
-            Human = hooks?.Human ?? parent?.Human ?? ModeHumanGate.Instance
+            Human = hooks?.Human ?? parent?.Human ?? ModeHumanGate.Instance,
+            ToolRules = hooks?.ToolRules ?? parent?.ToolRules
         };
         foreach (var t in (await _registry.LoadAsync(ToolsToLoad(agent, chat))).Values) ctx.ActiveTools[t.Name] = t;
         await SaveActiveToolsAsync(ctx);
@@ -434,7 +435,8 @@ public sealed class AgentRunner
     }
 
     /// <summary>Executa uma unica ferramenta fora de um agente (no de workflow), com a mesma politica e auditoria.</summary>
-    public async Task<(bool Ok, string Output, Guid RunId)> RunToolAsync(string toolName, JsonObject args, Guid? workflowRunId, CancellationToken ct)
+    public async Task<(bool Ok, string Output, Guid RunId)> RunToolAsync(string toolName, JsonObject args, Guid? workflowRunId, IHumanGate human,
+                                                                          WorkflowToolRules? rules, CancellationToken ct)
     {
         var runId = Guid.NewGuid();
         var agentId = "workflow:" + toolName;
@@ -457,7 +459,9 @@ public sealed class AgentRunner
             Agent = pseudoAgent,
             Model = dummyModel,
             Depth = 0,
-            Budget = new Budget(0)
+            Budget = new Budget(0),
+            Human = human,
+            ToolRules = rules
         };
         ctx.ActiveTools[toolName] = tools[toolName];
         await _events.AddAsync(ctx, "run_started", new JsonObject { ["agent"] = agentId, ["depth"] = 0, ["input"] = input });

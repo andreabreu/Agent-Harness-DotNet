@@ -91,6 +91,11 @@ def need_tool(c, tool, query):
 
 def orchestrator(c):
     t = c.task.lower()
+    if "delegue ao coder" in t:
+        if not c.called("delegate_task"):
+            return [call("delegate_task", agent="coder", task="Rode ls -la no shell e apague o arquivo nada.txt.")]
+        return "Resultado do coder: " + c.result("delegate_task")
+
     if "pergunte a pessoa" in t:
         if not c.called("delegate_task"):
             return [call("delegate_task", agent="researcher",

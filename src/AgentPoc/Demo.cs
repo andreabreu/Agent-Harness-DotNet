@@ -57,6 +57,10 @@ public static class Demo
             "do filho vence, outra varredura o recupera (run_recovered), ele conclui com a resposta ja gravada (sem chamar o modelo " +
             "de novo) e o pai termina com um unico tool_result. Um pai deixado em waiting_child com o filho ja terminado (o estado " +
             "que a versao anterior podia produzir) e corrigido pela reconciliacao do despachante.", new ScenarioFn(DurabilidadeEntrega)),
+        ("workflow_aprovacao", "Aprovacao segura em workflows: padrao deny, modo explicito e regras por workflow",
+            "Sem ninguem para responder, um workflow nega as ferramentas que exigem aprovacao, inclusive nos subagentes; o modo " +
+            "explicito continua possivel e fica registrado na execucao; cada decisao de politica grava a sua origem.",
+            new ScenarioFn(WorkflowAprovacao)),
     };
 
     private static readonly TimeSpan DemoDispatcherSweep = TimeSpan.FromSeconds(1);
@@ -637,6 +641,97 @@ public static class Demo
         s.Checks.Add(new Check("Reconciliacao: pai preso com filho terminado recebeu o resultado e terminou",
             _ => final.Status == RunStatus.Completed && final.Output.Contains("homologacao")));
         s.Checks.Add(new Check("Reconciliacao gravou o tool_result uma unica vez", _ => delivered == 1));
+    }
+
+    private const string ShellToolNode = """{"type": "tool", "tool": "run_shell", "args": {"command": "echo aprovado"}, "next": []}""";
+    private const string DelegateToCoderNode = """{"type": "agent", "agent": "orchestrator", "input": "delegue ao coder: rode ls -la no shell", "next": []}""";
+
+    private sealed record WorkflowPolicyEvent(string Agent, string Tool, string Decision, string Source);
+
+    private sealed record WorkflowApprovalRun(Guid Id, string Status, List<WorkflowPolicyEvent> Policy, long ShellStarts)
+    {
+        public bool Has(string tool, string decision, string source, string? agent = null) =>
+            Policy.Any(p => p.Tool == tool && p.Decision == decision && p.Source == source && (agent == null || p.Agent == agent));
+    }
+
+    private static async Task<WorkflowApprovalRun> RunApprovalWorkflowAsync(App app, EvidenceSession s, string id, string nodeJson,
+                                                                            WorkflowApprovalMode? approval, CancellationToken ct,
+                                                                            string toolRules = "{}")
+    {
+        await SaveDemoWorkflowAsync(app, id, """{"tools": """ + toolRules + """, "nodes": {"passo": """ + nodeJson + "}}");
+        var result = await app.Workflows.RunAsync(id, "cenario workflow_aprovacao", approval: approval, ct: ct);
+        s.WorkflowRuns.Add(result.WorkflowRunId);
+        var policy = (await app.Db.QueryAsync(
+                @"select r.agent_id, e.data->>'tool' as tool, e.data->>'decision' as decision, coalesce(e.data->>'source', '') as source
+                    from run_events e join runs r on r.id = e.run_id
+                   where r.workflow_run_id = @w and e.type = 'policy' order by e.id", ("w", result.WorkflowRunId)))
+            .Select(r => new WorkflowPolicyEvent(r.S("agent_id"), r.S("tool"), r.S("decision"), r.S("source"))).ToList();
+        var shellStarts = Convert.ToInt64(await app.Db.ScalarAsync(
+            @"select count(*) from run_events e join runs r on r.id = e.run_id
+               where r.workflow_run_id = @w and e.type = 'tool_call_started' and e.data->>'name' = 'run_shell'", ("w", result.WorkflowRunId)));
+        Log.Write(0, ConsoleColor.Cyan, id, $"{result.Status}: {string.Join(", ", policy.Select(p => $"{p.Agent}/{p.Tool}={p.Decision} ({p.Source})"))}");
+        return new WorkflowApprovalRun(result.WorkflowRunId, result.Status, policy, shellStarts);
+    }
+
+    private static Task SaveDemoWorkflowAsync(App app, string id, string definition) =>
+        app.Db.ExecAsync(
+            @"insert into workflows (id, description, definition) values (@id, 'cenario workflow_aprovacao', @d::jsonb)
+              on conflict (id) do update set definition = excluded.definition,
+                version = workflows.version + case when workflows.definition is distinct from excluded.definition then 1 else 0 end",
+            ("id", id), ("d", definition));
+
+    private static async Task WorkflowAprovacao(App app, EvidenceSession s, CancellationToken ct)
+    {
+        Approval.Mode = "auto";
+        s.Notes.Add("O modo global da CLI fica em 'auto' de proposito: os workflows nao podem herda-lo.");
+        WorkflowApprovalRun? byDefault = null, explicitAuto = null, delegated = null, allowed = null, blocked = null, denyWhen = null, inherited = null;
+        Dictionary<string, object?>? storedMode = null;
+        string? invalidRulesError = null;
+        long invalidRulesRuns = -1;
+
+        s.Checks.Add(new Check("Sem modo informado, run_shell do no de ferramenta foi negado como padrao do workflow e nao comecou",
+            _ => byDefault is { Status: "failed", ShellStarts: 0 } && byDefault.Has("run_shell", "denied", PolicySource.ModeDefault)));
+        s.Checks.Add(new Check("Modo 'auto' explicito executou run_shell e registrou a origem explicita",
+            _ => explicitAuto is { Status: "completed", ShellStarts: 1 } && explicitAuto.Has("run_shell", "approved", PolicySource.ModeExplicit)));
+        s.Checks.Add(new Check("Subagente (coder) delegado por um no de agente herdou o padrao: run_shell negado",
+            _ => delegated != null && delegated.Has("run_shell", "denied", PolicySource.ModeDefault, agent: "coder") && delegated.ShellStarts == 0));
+        s.Checks.Add(new Check("A execucao gravou o modo (deny) e que ele foi o padrao, nao uma escolha",
+            _ => storedMode?.S("approval_mode") == "deny" && storedMode?.B("approval_mode_explicit") == false));
+        s.Checks.Add(new Check("Regra 'allow' do workflow liberou run_shell sem pedido, mesmo sem modo informado",
+            _ => allowed is { Status: "completed", ShellStarts: 1 } && allowed.Has("run_shell", "approved", PolicySource.WorkflowAllow)));
+        s.Checks.Add(new Check("Regra 'block' do workflow bloqueou kb_search, que a politica global executa sozinha",
+            _ => blocked is { Status: "failed" } && blocked.Has("kb_search", "blocked", PolicySource.WorkflowBlock)));
+        s.Checks.Add(new Check("Com run_shell liberado, 'sudo ls' continuou bloqueado pela regra deny_when",
+            _ => denyWhen is { Status: "failed", ShellStarts: 0 } && denyWhen.Has("run_shell", "blocked", PolicySource.DenyWhen)));
+        s.Checks.Add(new Check("Subagente herdou a regra 'allow' (run_shell executou) e delete_file seguiu bloqueado pela politica global",
+            _ => inherited != null && inherited.Has("run_shell", "approved", PolicySource.WorkflowAllow, agent: "coder") &&
+                 inherited.Has("delete_file", "blocked", PolicySource.ToolPolicy, agent: "coder") && inherited.ShellStarts == 1));
+        s.Checks.Add(new Check("Regra com ferramenta inexistente impediu o inicio e a mensagem cita o padrao",
+            _ => invalidRulesError?.Contains("ferramenta_inexistente") == true && invalidRulesRuns == 0));
+
+        byDefault = await RunApprovalWorkflowAsync(app, s, "demo_aprovacao_tool", ShellToolNode, null, ct);
+        storedMode = await app.Db.QueryOneAsync("select approval_mode, approval_mode_explicit from workflow_runs where id = @id", ("id", byDefault.Id));
+        explicitAuto = await RunApprovalWorkflowAsync(app, s, "demo_aprovacao_tool", ShellToolNode, WorkflowApprovalMode.From("auto", null), ct);
+        delegated = await RunApprovalWorkflowAsync(app, s, "demo_aprovacao_agente", DelegateToCoderNode, null, ct);
+
+        const string allowShell = """{"allow": ["run_shell"]}""";
+        allowed = await RunApprovalWorkflowAsync(app, s, "demo_aprovacao_allow", ShellToolNode, null, ct, allowShell);
+        blocked = await RunApprovalWorkflowAsync(app, s, "demo_aprovacao_block",
+            """{"type": "tool", "tool": "kb_search", "args": {"query": "aprovacao"}, "next": []}""", null, ct, """{"block": ["kb_search"]}""");
+        denyWhen = await RunApprovalWorkflowAsync(app, s, "demo_aprovacao_deny_when",
+            """{"type": "tool", "tool": "run_shell", "args": {"command": "sudo ls"}, "next": []}""", null, ct, allowShell);
+        inherited = await RunApprovalWorkflowAsync(app, s, "demo_aprovacao_heranca", DelegateToCoderNode, null, ct, allowShell);
+
+        try
+        {
+            await RunApprovalWorkflowAsync(app, s, "demo_aprovacao_invalido", ShellToolNode, null, ct, """{"block": ["ferramenta_inexistente"]}""");
+        }
+        catch (InvalidOperationException ex)
+        {
+            invalidRulesError = ex.Message;
+            Log.Write(0, ConsoleColor.Cyan, "demo_aprovacao_invalido", ex.Message);
+        }
+        invalidRulesRuns = Convert.ToInt64(await app.Db.ScalarAsync("select count(*) from workflow_runs where workflow_id = 'demo_aprovacao_invalido'"));
     }
 
     private sealed class CountingObserver : IRunObserver

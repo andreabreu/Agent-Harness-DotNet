@@ -73,9 +73,14 @@ public sealed class ToolExecutor
         if (!ctx.ActiveTools.TryGetValue(call.Name, out var def))
             return await Finish(ctx, call.Name, false, sw, $"ERRO: a ferramenta '{call.Name}' nao esta carregada. Use search_tools para encontra-la.");
 
-        var policy = ToolPolicy.Resolve(def.Policy, def.ConfigJson, args);
+        var policy = ToolPolicy.Resolve(def.Policy, def.ConfigJson, args, ctx.ToolRules, def.Name);
         if (policy.Decision == PolicyDecision.Deny)
-            return await BlockAsync(ctx, def, sw, policy.Reason);
+            return await BlockAsync(ctx, def, sw, policy.Reason, policy.Source);
+        if (policy.Source == PolicySource.WorkflowAllow)
+            await _events.AddAsync(ctx, "policy", new JsonObject
+            {
+                ["tool"] = def.Name, ["decision"] = "approved", ["reason"] = policy.Reason, ["source"] = policy.Source
+            });
 
         if (policy.Decision == PolicyDecision.Approval)
         {
@@ -85,7 +90,9 @@ public sealed class ToolExecutor
                 ["tool"] = def.Name,
                 ["decision"] = decision.Approved ? "approved" : "denied",
                 ["reason"] = decision.Reason,
-                ["policy_reason"] = policy.Reason
+                ["policy_reason"] = policy.Reason,
+                ["source"] = decision.Source,
+                ["policy_source"] = policy.Source
             };
             if (decision.EditedArgs != null)
             {
@@ -101,8 +108,8 @@ public sealed class ToolExecutor
             if (decision.EditedArgs != null)
             {
                 args = decision.EditedArgs;
-                if (ToolPolicy.Resolve(def.Policy, def.ConfigJson, args) is { Decision: PolicyDecision.Deny } recheck)
-                    return await BlockAsync(ctx, def, sw, $"argumentos editados violam {recheck.Reason}");
+                if (ToolPolicy.Resolve(def.Policy, def.ConfigJson, args, ctx.ToolRules, def.Name) is { Decision: PolicyDecision.Deny } recheck)
+                    return await BlockAsync(ctx, def, sw, $"argumentos editados violam {recheck.Reason}", recheck.Source);
             }
         }
 
@@ -135,9 +142,9 @@ public sealed class ToolExecutor
         return await Finish(ctx, call.Name, ok, sw, output);
     }
 
-    private async Task<string> BlockAsync(RunContext ctx, ToolDef def, Stopwatch sw, string reason)
+    private async Task<string> BlockAsync(RunContext ctx, ToolDef def, Stopwatch sw, string reason, string source)
     {
-        await _events.AddAsync(ctx, "policy", new JsonObject { ["tool"] = def.Name, ["decision"] = "blocked", ["reason"] = reason });
+        await _events.AddAsync(ctx, "policy", new JsonObject { ["tool"] = def.Name, ["decision"] = "blocked", ["reason"] = reason, ["source"] = source });
         Log.Write(ctx.Depth, ConsoleColor.Red, "politica", $"{def.Name} BLOQUEADA ({reason})");
         return await Finish(ctx, def.Name, false, sw, $"BLOQUEADO: '{def.Name}' nao pode executar ({reason}). Nao tente novamente nem contorne; informe ao solicitante.");
     }

@@ -64,6 +64,9 @@ public sealed class RunContext
     /// <summary>Quem responde pelo humano: aprovacoes e perguntas (ask_human). Herdado pelos subagentes.</summary>
     public IHumanGate Human { get; init; } = ModeHumanGate.Instance;
 
+    /// <summary>Ferramentas liberadas/bloqueadas pelo workflow que iniciou o run. Herdado pelos subagentes.</summary>
+    public WorkflowToolRules? ToolRules { get; init; }
+
     /// <summary>Ferramentas que o modelo enxerga agora. Cresce via search_tools.</summary>
     public Dictionary<string, ToolDef> ActiveTools { get; } = new(StringComparer.Ordinal);
 
@@ -114,7 +117,7 @@ public interface IRunObserver
 }
 
 /// <summary>Decisao humana sobre uma ferramenta; o humano pode corrigir os argumentos antes de aprovar.</summary>
-public sealed record ApprovalDecision(bool Approved, string Reason, JsonObject? EditedArgs = null);
+public sealed record ApprovalDecision(bool Approved, string Reason, JsonObject? EditedArgs = null, string Source = PolicySource.Human);
 
 /// <summary>Pedido ao humano: aprovar uma tool call ou responder uma pergunta do agente.</summary>
 public interface IHumanGate
@@ -160,21 +163,39 @@ public static class Approval
     public static string Mode { get; set; } = "auto";
 }
 
-/// <summary>Gate da CLI: segue Approval.Mode (auto aprova, deny nega, ask pergunta no terminal).</summary>
+/// <summary>
+/// Gate por modo (auto aprova, deny nega, ask pergunta no terminal). <see cref="Instance"/> segue o modo global
+/// da CLI (Approval.Mode); <see cref="For"/> fixa o modo de uma execucao (workflow).
+/// </summary>
 public sealed class ModeHumanGate : IHumanGate
 {
     public const string NoHumanAnswer =
         "SEM RESPOSTA: nao ha uma pessoa disponivel neste modo de execucao. Siga com a opcao mais segura e deixe a suposicao explicita no resultado.";
+    public const string DefaultDenyReason = "negado por padrao em workflow (sem modo de aprovacao informado)";
 
-    public static readonly ModeHumanGate Instance = new();
+    public static readonly ModeHumanGate Instance = new(() => Approval.Mode, explicitMode: true);
     private static readonly SemaphoreSlim ConsoleGate = new(1, 1);
+
+    private readonly Func<string> _mode;
+    private readonly bool _explicitMode;
+
+    private ModeHumanGate(Func<string> mode, bool explicitMode)
+    {
+        _mode = mode;
+        _explicitMode = explicitMode;
+    }
+
+    /// <param name="explicitMode">false quando o modo e o padrao seguro, sem ninguem ter escolhido.</param>
+    public static ModeHumanGate For(string mode, bool explicitMode) => new(() => mode, explicitMode);
+
+    private string Source => _explicitMode ? PolicySource.ModeExplicit : PolicySource.ModeDefault;
 
     public async Task<ApprovalDecision> ApproveAsync(RunContext ctx, string toolCallId, string tool, JsonObject args, string policyReason, CancellationToken ct)
     {
-        switch (Approval.Mode)
+        switch (_mode())
         {
             case "deny":
-                return new ApprovalDecision(false, "negado automaticamente (APPROVAL_MODE=deny)");
+                return new ApprovalDecision(false, _explicitMode ? "negado automaticamente (APPROVAL_MODE=deny)" : DefaultDenyReason, Source: Source);
             case "ask":
                 await ConsoleGate.WaitAsync(ct);
                 try
@@ -186,13 +207,13 @@ public sealed class ModeHumanGate : IHumanGate
                     ConsoleGate.Release();
                 }
             default:
-                return new ApprovalDecision(true, "aprovado automaticamente (APPROVAL_MODE=auto)");
+                return new ApprovalDecision(true, "aprovado automaticamente (APPROVAL_MODE=auto)", Source: Source);
         }
     }
 
     public async Task<string> AskAsync(RunContext ctx, string toolCallId, string question, IReadOnlyList<string> options, CancellationToken ct)
     {
-        if (Approval.Mode != "ask") return NoHumanAnswer;
+        if (_mode() != "ask") return NoHumanAnswer;
         await ConsoleGate.WaitAsync(ct);
         try
         {
@@ -230,7 +251,7 @@ public sealed class ModeHumanGate : IHumanGate
 }
 
 /// <summary>Como acompanhar e governar um run (herdado pelos subagentes quando nulo).</summary>
-public sealed record RunHooks(IRunObserver? Observer = null, IHumanGate? Human = null);
+public sealed record RunHooks(IRunObserver? Observer = null, IHumanGate? Human = null, WorkflowToolRules? ToolRules = null);
 
 /// <summary>Continuacao de uma conversa: historico ja persistido e o que o harness deve restaurar.</summary>
 public sealed record ChatTurn(

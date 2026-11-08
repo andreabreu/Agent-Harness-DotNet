@@ -114,13 +114,23 @@ try
         {
             Guid? resume = Guid.TryParse(Opt("resume"), out var g) ? g : null;
             if (resume == null && positional.Count < 3) { Help(); return 1; }
+            AgentPoc.Workflows.WorkflowApprovalMode approval;
+            try
+            {
+                approval = AgentPoc.Workflows.WorkflowApprovalMode.From(Opt("approval"), Env.Get("APPROVAL_MODE"));
+            }
+            catch (ArgumentException ex)
+            {
+                Log.Error(ex.Message);
+                return 1;
+            }
             var id = positional.Count > 1 ? positional[1] : "";
             var input = positional.Count > 2 ? string.Join(" ", positional.Skip(2)) : null;
             var session = new EvidenceSession { Scenario = "workflow-" + (id.Length > 0 ? id : "resume"), Title = $"Workflow {id}", Proves = "Execucao avulsa de workflow." };
             session.Checks.Add(new Check("Workflow concluido", d => d.WorkflowRuns.Values.All(w => w.Status == "completed")));
             try
             {
-                var r = await app.Workflows.RunAsync(id, input, resume, Opt("crash-after"), cts.Token);
+                var r = await app.Workflows.RunAsync(id, input, resume, Opt("crash-after"), approval, cts.Token);
                 session.WorkflowRuns.Add(r.WorkflowRunId);
                 Log.Title("SAIDA DO WORKFLOW");
                 Log.Raw(r.Output);
@@ -265,6 +275,7 @@ void Help()
            [--budget N] [--approval auto|deny|ask]
       workflow <id> "<entrada>"         roda um workflow  [--crash-after <no>]
       workflow --resume <workflow_run>  retoma um workflow interrompido
+           [--approval deny|auto|ask]   padrao deny: sem modo informado, nega ferramentas de aprovacao
       worker [--concurrency N] [--once] processa a fila de tarefas
       dispatcher [--concurrency N]      so retoma runs prontos (decisao humana, prazo vencido, filho terminou)
       demo [autonomia|workflow|fila|governanca|retomada|all]
