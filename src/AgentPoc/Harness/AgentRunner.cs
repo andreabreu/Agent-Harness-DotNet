@@ -53,9 +53,11 @@ public sealed class AgentRunner
     /// <param name="hooks">Observer ao vivo e quem responde pelo humano; quando nulos, herda do pai ou usa o padrao da CLI.</param>
     /// <param name="runId">Id do run definido por quem chama (para registrar a execucao antes de comecar).</param>
     /// <param name="parentToolCallId">Chamada delegate_task do pai que cria este run (torna a delegacao idempotente).</param>
+    /// <param name="workflowNodeId">No do workflow que cria este run (a retomada do workflow acha o run interrompido por ele).</param>
     public async Task<RunResult> RunAsync(string agentId, string input, RunContext? parent = null, Guid? workflowRunId = null,
                                           long? budgetOverride = null, ChatTurn? chat = null, RunHooks? hooks = null,
-                                          Guid? runId = null, string? parentToolCallId = null, CancellationToken ct = default)
+                                          Guid? runId = null, string? parentToolCallId = null, string? workflowNodeId = null,
+                                          CancellationToken ct = default)
     {
         var agent = await _config.GetAgentAsync(agentId)
                     ?? throw new InvalidOperationException($"Agente '{agentId}' nao existe ou esta desabilitado.");
@@ -70,11 +72,11 @@ public sealed class AgentRunner
 
         await _db.ExecAsync(
             @"insert into runs (id, parent_run_id, root_run_id, workflow_run_id, conversation_id, agent_id, agent_version, model_id, input, depth,
-                                budget_limit, parent_tool_call_id, owner, lease_until)
-              values (@id, @p, @root, @wf, @conv, @a, @v, @m, @i, @d, @b, @call, @owner, now() + make_interval(secs => @lease))",
+                                budget_limit, parent_tool_call_id, workflow_node_id, owner, lease_until)
+              values (@id, @p, @root, @wf, @conv, @a, @v, @m, @i, @d, @b, @call, @node, @owner, now() + make_interval(secs => @lease))",
             ("id", id), ("p", parent?.RunId), ("root", rootId), ("wf", wfRun), ("conv", conversationId), ("a", agent.Id),
             ("v", agent.Version), ("m", model.Id), ("i", input), ("d", depth), ("b", budget.Limit), ("call", parentToolCallId),
-            ("owner", InstanceId), ("lease", _lease.Lease.TotalSeconds));
+            ("node", workflowNodeId), ("owner", InstanceId), ("lease", _lease.Lease.TotalSeconds));
 
         var ctx = new RunContext
         {
@@ -154,6 +156,7 @@ public sealed class AgentRunner
             Budget = budget,
             Observer = hooks.Observer,
             Human = hooks.Human ?? ModeHumanGate.Instance,
+            ToolRules = hooks.ToolRules,
             SeqStart = lastSeq
         };
         var activeTools = run.A("active_tools");
@@ -233,7 +236,7 @@ public sealed class AgentRunner
         var leaseLost = false;
         var client = LlmFactory.For(model);
         var stream = StreamFor(ctx);
-        await using var lease = RunLeaseKeeper.Start(_db, ctx.RunId, InstanceId, _lease, ct);
+        await using var lease = RunLeaseKeeper.ForRun(_db, ctx.RunId, InstanceId, _lease, ct);
         var token = lease.Token;
 
         try
@@ -434,47 +437,80 @@ public sealed class AgentRunner
         return calls.Where(c => !answered.Contains(c.Id)).ToList();
     }
 
-    /// <summary>Executa uma unica ferramenta fora de um agente (no de workflow), com a mesma politica e auditoria.</summary>
-    public async Task<(bool Ok, string Output, Guid RunId)> RunToolAsync(string toolName, JsonObject args, Guid? workflowRunId, IHumanGate human,
-                                                                          WorkflowToolRules? rules, CancellationToken ct)
+    /// <summary>
+    /// Executa uma unica ferramenta fora de um agente (no de workflow), com a mesma politica e auditoria. O run e a
+    /// chamada tem ids estaveis por tentativa do no: na retomada, um resultado ja gravado e devolvido e uma chamada
+    /// interrompida segue <see cref="ToolExecutor.ExecutePendingAsync"/> (com efeito colateral, nao repete sozinha).
+    /// </summary>
+    public async Task<(bool Ok, string Output, Guid RunId)> RunToolAsync(string toolName, JsonObject args, Guid workflowRunId, string workflowNodeId,
+                                                                          int attempt, IHumanGate human, WorkflowToolRules? rules, CancellationToken ct)
     {
-        var runId = Guid.NewGuid();
+        var runId = StableId($"{workflowRunId}/{workflowNodeId}/{attempt}");
+        var call = new ToolCall($"wf_{workflowNodeId}_{attempt}", toolName, args.ToJsonString());
         var agentId = "workflow:" + toolName;
         var input = $"{toolName}({args.ToJsonString(Text.RelaxedJson)})";
         var tools = await _registry.LoadAsync(new[] { toolName });
         if (!tools.ContainsKey(toolName)) return (false, $"ERRO: ferramenta '{toolName}' nao existe.", runId);
 
-        await _db.ExecAsync(
-            @"insert into runs (id, root_run_id, workflow_run_id, agent_id, input, depth) values (@id, @id, @wf, @a, @i, 0)",
-            ("id", runId), ("wf", workflowRunId), ("a", agentId), ("i", input));
-        var pseudoAgent = new AgentCfg(agentId, "no de ferramenta de workflow", "", "", new[] { toolName }, new[] { toolName },
-            Array.Empty<string>(), 1, 0, null, 1);
-        var dummyModel = new ModelCfg("none", new ProviderCfg("none", "openai_compat", "", null, "none", "{}"), "", false, false,
-            "max_tokens", 0, 0, 0, 0);
+        var existing = await _db.QueryOneAsync(
+            "select status, output, (select coalesce(max(seq), 0) from run_events where run_id = @id) as last_seq from runs where id = @id",
+            ("id", runId));
+        if (existing != null && existing.S("status") != RunStatus.Running)
+            return (existing.S("status") == RunStatus.Completed, existing.S("output"), runId);
+
         var ctx = new RunContext
         {
             RunId = runId,
             RootRunId = runId,
             WorkflowRunId = workflowRunId,
-            Agent = pseudoAgent,
-            Model = dummyModel,
+            Agent = new AgentCfg(agentId, "no de ferramenta de workflow", "", "", new[] { toolName }, new[] { toolName },
+                Array.Empty<string>(), 1, 0, null, 1),
+            Model = new ModelCfg("none", new ProviderCfg("none", "openai_compat", "", null, "none", "{}"), "", false, false,
+                "max_tokens", 0, 0, 0, 0),
             Depth = 0,
             Budget = new Budget(0),
             Human = human,
-            ToolRules = rules
+            ToolRules = rules,
+            SeqStart = existing?.I("last_seq") ?? 0
         };
         ctx.ActiveTools[toolName] = tools[toolName];
-        await _events.AddAsync(ctx, "run_started", new JsonObject { ["agent"] = agentId, ["depth"] = 0, ["input"] = input });
 
-        var output = await _executor.ExecuteAsync(ctx, new ToolCall("wf_" + Guid.NewGuid().ToString("N").Substring(0, 8), toolName, args.ToJsonString()), ct);
-        var ok = !output.StartsWith("ERRO", StringComparison.Ordinal) && !output.StartsWith("BLOQUEADO", StringComparison.Ordinal) &&
-                 !output.StartsWith("NEGADO", StringComparison.Ordinal);
-        var status = ok ? "completed" : "failed";
+        string output;
+        if (existing == null)
+        {
+            await _db.ExecAsync(
+                @"insert into runs (id, root_run_id, workflow_run_id, workflow_node_id, agent_id, input, depth) values (@id, @id, @wf, @n, @a, @i, 0)",
+                ("id", runId), ("wf", workflowRunId), ("n", workflowNodeId), ("a", agentId), ("i", input));
+            await _events.AddAsync(ctx, "run_started", new JsonObject { ["agent"] = agentId, ["depth"] = 0, ["input"] = input });
+            output = await _executor.ExecuteAsync(ctx, call, ct);
+        }
+        else if (await RecordedToolOutputAsync(runId) is { } recorded)
+            output = recorded;
+        else
+        {
+            await _events.AddAsync(ctx, "run_resumed", new JsonObject { ["by"] = InstanceId });
+            output = await _executor.ExecutePendingAsync(ctx, call, ct);
+        }
+
+        var ok = IsToolSuccess(output);
+        var status = ok ? RunStatus.Completed : RunStatus.Failed;
         await _db.ExecAsync("update runs set status = @s, output = @o, steps = 1, finished_at = now() where id = @id",
             ("s", status), ("o", output), ("id", runId));
         await _events.AddAsync(ctx, "run_finished", new JsonObject { ["status"] = status, ["output"] = Text.Trunc(output, 4000) });
         return (ok, output, runId);
     }
+
+    /// <summary>Resultado da ferramenta ja gravado (queda entre o tool_result e o fim do run).</summary>
+    private async Task<string?> RecordedToolOutputAsync(Guid runId) =>
+        (string?)await _db.ScalarAsync(
+            "select data->>'output' from run_events where run_id = @id and type = 'tool_result' order by seq desc limit 1", ("id", runId));
+
+    private static bool IsToolSuccess(string output) =>
+        !output.StartsWith("ERRO", StringComparison.Ordinal) && !output.StartsWith("BLOQUEADO", StringComparison.Ordinal) &&
+        !output.StartsWith("NEGADO", StringComparison.Ordinal);
+
+    /// <summary>Guid deterministico (MD5 do texto): o mesmo no e tentativa sempre gera o mesmo id de run.</summary>
+    private static Guid StableId(string key) => new(System.Security.Cryptography.MD5.HashData(Encoding.UTF8.GetBytes(key)));
 
     private static string BuildSystem(AgentCfg agent, RunContext ctx, ChatTurn? chat)
     {

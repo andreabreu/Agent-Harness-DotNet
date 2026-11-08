@@ -206,6 +206,17 @@ alter table workflow_runs add column if not exists approval_mode_explicit boolea
 alter table workflow_runs drop constraint if exists workflow_runs_approval_mode_check;
 alter table workflow_runs add constraint workflow_runs_approval_mode_check
     check (approval_mode in ('deny', 'auto', 'ask'));
+alter table workflow_runs drop constraint if exists workflow_runs_status_check;
+alter table workflow_runs add constraint workflow_runs_status_check
+    check (status in ('running', 'ready', 'completed', 'failed', 'crashed', 'cancelled', 'expired', 'compensation_failed'));
+alter table workflow_runs add column if not exists owner text;                    -- instancia que executa a execucao
+alter table workflow_runs add column if not exists lease_until timestamptz;       -- renovado por heartbeat; vencido = orfa
+alter table workflow_runs add column if not exists definition jsonb;              -- versao fixa: copia da definicao no inicio
+alter table workflow_runs add column if not exists deadline_at timestamptz;       -- prazo total (timeout_seconds do workflow)
+alter table workflow_runs add column if not exists cancel_requested_at timestamptz;
+create index if not exists ix_workflow_runs_lease on workflow_runs(lease_until) where status = 'running';
+create index if not exists ix_workflow_runs_ready on workflow_runs(started_at) where status = 'ready';
+alter table runs add column if not exists workflow_node_id text;                  -- no do workflow que criou o run
 -- tarefa criada dentro de um workflow: o worker aplica o modo de aprovacao e as regras daquela execucao
 alter table tasks add column if not exists workflow_run_id uuid references workflow_runs(id);
 
@@ -224,6 +235,17 @@ alter table workflow_node_runs drop constraint if exists workflow_node_runs_stat
 alter table workflow_node_runs add constraint workflow_node_runs_status_check
     check (status in ('running', 'completed', 'failed', 'skipped'));
 alter table workflow_node_runs add column if not exists chosen_next text[];  -- desvio concluido: destinos escolhidos
+alter table workflow_node_runs add column if not exists compensated_at timestamptz;
+
+create table if not exists workflow_events (
+    id              bigserial primary key,
+    workflow_run_id uuid not null references workflow_runs(id),
+    type            text not null,
+    node_id         text,
+    data            jsonb not null default '{}'::jsonb,
+    created_at      timestamptz not null default clock_timestamp()
+);
+create index if not exists ix_workflow_events_run on workflow_events(workflow_run_id, id);
 
 -- ---------------- chat ----------------
 

@@ -66,6 +66,10 @@ public static class Demo
             "condition escolhe o ramo e os outros ficam pulados; a consolidacao junta so os ramos ativos; uma queda depois do " +
             "desvio e retomada no mesmo ramo sem chamar o classificador de novo; entrada tipada, transform e end fecham o fluxo.",
             new ScenarioFn(WorkflowDesvio)),
+        ("workflow_resiliente", "Execucao resiliente de workflows: retomada automatica e versao fixa",
+            "Uma execucao cujo dono morreu (lease vencido) e recuperada pelo despachante e concluida sem repetir os nos " +
+            "prontos; uma execucao termina com a definicao com que comecou mesmo que o workflow mude no meio, e uma " +
+            "execucao antiga sem copia da definicao usa a atual e registra isso.", new ScenarioFn(WorkflowResiliente)),
     };
 
     private static readonly TimeSpan DemoDispatcherSweep = TimeSpan.FromSeconds(1);
@@ -904,6 +908,111 @@ public static class Demo
 
         await SaveDemoWorkflowAsync(app, "demo_triagem_invalida", TriageWorkflow.Replace("\"next\": [\"escalar\"]", "\"next\": [\"juridco\"]"));
         invalidDefinition = await StartErrorAsync(() => app.Workflows.RunAsync("demo_triagem_invalida", """{"texto": "x"}""", ct: ct));
+    }
+
+    private const string TwoStepWorkflow = """
+        {"nodes": {
+           "a": {"type": "tool", "tool": "kb_search", "args": {"query": "agentes"}, "next": ["b"]},
+           "b": {"type": "tool", "tool": "kb_search", "args": {"query": "workflow"}}
+         }}
+        """;
+
+    private static readonly TimeSpan RecoveryTimeout = TimeSpan.FromSeconds(30);
+
+    private static async Task<Dictionary<string, (string Status, int Attempt)>> NodesAsync(App app, Guid wfRunId) =>
+        (await app.Db.QueryAsync("select node_id, status, attempt from workflow_node_runs where workflow_run_id = @w", ("w", wfRunId)))
+            .ToDictionary(r => r.S("node_id"), r => (r.S("status"), r.I("attempt")));
+
+    private static async Task<List<System.Text.Json.Nodes.JsonObject>> WorkflowEventsAsync(App app, Guid wfRunId, string type) =>
+        (await app.Db.QueryAsync("select data::text as data from workflow_events where workflow_run_id = @w and type = @t order by id",
+            ("w", wfRunId), ("t", type)))
+            .Select(r => (System.Text.Json.Nodes.JsonObject)System.Text.Json.Nodes.JsonNode.Parse(r.S("data"))!).ToList();
+
+    private static async Task<string> WorkflowStatusAsync(App app, Guid wfRunId) =>
+        (string)(await app.Db.ScalarAsync("select status from workflow_runs where id = @id", ("id", wfRunId)))!;
+
+    private static async Task<Guid> CrashAfterAsync(App app, EvidenceSession s, string workflowId, string node, CancellationToken ct)
+    {
+        try
+        {
+            await app.Workflows.RunAsync(workflowId, "cenario workflow_resiliente", crashAfter: node, ct: ct);
+            throw new InvalidOperationException($"Workflow '{workflowId}' nao caiu depois de '{node}'.");
+        }
+        catch (SimulatedCrashException ex)
+        {
+            s.WorkflowRuns.Add(ex.WorkflowRunId);
+            Log.Warn(ex.Message);
+            return ex.WorkflowRunId;
+        }
+    }
+
+    private static async Task WaitWorkflowFinishedAsync(App app, Guid wfRunId, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + RecoveryTimeout;
+        while (await WorkflowStatusAsync(app, wfRunId) is "running" or "ready")
+        {
+            if (DateTime.UtcNow > deadline) throw new TimeoutException($"workflow run {Text.Short(wfRunId)} nao terminou em {RecoveryTimeout.TotalSeconds:0}s.");
+            await Task.Delay(200, ct);
+        }
+    }
+
+    private static async Task WorkflowResiliente(App app, EvidenceSession s, CancellationToken ct)
+    {
+        Approval.Mode = "auto";
+        Dictionary<string, (string Status, int Attempt)> orphanNodes = new(), pinnedNodes = new(), newNodes = new(), unpinnedNodes = new();
+        List<System.Text.Json.Nodes.JsonObject> recovered = new(), notPinned = new();
+        string orphanStatus = "", pinnedStatus = "";
+        string? liveOwnerRefusal = null;
+
+        s.Checks.Add(new Check("Execucao orfa (dono morto, lease vencido) recuperada pelo despachante e concluida",
+            _ => orphanStatus == "completed" && recovered.Count == 1 && recovered[0]["previous_owner"]?.GetValue<string>() == "instancia-morta"));
+        s.Checks.Add(new Check("Na recuperacao, o no ja concluido nao rodou de novo e o seguinte executou",
+            _ => orphanNodes.GetValueOrDefault("a") == ("completed", 1) && orphanNodes.GetValueOrDefault("b").Status == "completed"));
+        s.Checks.Add(new Check("Retomada manual de execucao com dono vivo (lease valido) recusada citando o dono",
+            _ => liveOwnerRefusal?.Contains("outra-instancia") == true));
+        s.Checks.Add(new Check("Versao fixa: a retomada terminou com a definicao antiga (b), apesar da troca para b2",
+            _ => pinnedStatus == "completed" && pinnedNodes.ContainsKey("b") && !pinnedNodes.ContainsKey("b2")));
+        s.Checks.Add(new Check("Uma execucao nova usa a definicao nova (b2)",
+            _ => newNodes.ContainsKey("b2") && !newNodes.ContainsKey("b")));
+        s.Checks.Add(new Check("Execucao antiga sem copia (iniciada na v2) retomou com a definicao atual (v1, b) e registrou definition_not_pinned",
+            _ => notPinned.Count == 1 && unpinnedNodes.GetValueOrDefault("b").Status == "completed" && !unpinnedNodes.ContainsKey("b2")));
+
+        await SaveDemoWorkflowAsync(app, "demo_resiliente_orfa", TwoStepWorkflow);
+        var orphan = await CrashAfterAsync(app, s, "demo_resiliente_orfa", "a", ct);
+        await app.Db.ExecAsync(
+            "update workflow_runs set status = 'running', owner = 'instancia-morta', lease_until = now() - interval '1 minute' where id = @id",
+            ("id", orphan));
+        Log.Write(0, ConsoleColor.Yellow, "orfa", $"execucao {Text.Short(orphan)} forjada como running de 'instancia-morta' com lease vencido");
+        await WithDispatcherAsync(app, ct, () => WaitWorkflowFinishedAsync(app, orphan, ct));
+        orphanStatus = await WorkflowStatusAsync(app, orphan);
+        orphanNodes = await NodesAsync(app, orphan);
+        recovered = await WorkflowEventsAsync(app, orphan, WorkflowEvents.Recovered);
+
+        var live = await CrashAfterAsync(app, s, "demo_resiliente_orfa", "a", ct);
+        await app.Db.ExecAsync(
+            "update workflow_runs set status = 'running', owner = 'outra-instancia', lease_until = now() + interval '1 minute' where id = @id",
+            ("id", live));
+        liveOwnerRefusal = await StartErrorAsync(() => app.Workflows.RunAsync("", null, resumeRunId: live, ct: ct));
+        await app.Db.ExecAsync("update workflow_runs set status = 'failed', owner = null, lease_until = null, finished_at = now() where id = @id", ("id", live));
+
+        await SaveDemoWorkflowAsync(app, "demo_resiliente_versao", TwoStepWorkflow);
+        var pinned = await CrashAfterAsync(app, s, "demo_resiliente_versao", "a", ct);
+        var v2 = TwoStepWorkflow.Replace("\"next\": [\"b\"]", "\"next\": [\"b2\"]").Replace("\"b\": {", "\"b2\": {");
+        await SaveDemoWorkflowAsync(app, "demo_resiliente_versao", v2);
+        Log.Write(0, ConsoleColor.Yellow, "versao", "definicao trocada para v2 (b -> b2) com a execucao parada no meio");
+        pinnedStatus = (await app.Workflows.RunAsync("", null, resumeRunId: pinned, ct: ct)).Status;
+        pinnedNodes = await NodesAsync(app, pinned);
+
+        var fresh = await app.Workflows.RunAsync("demo_resiliente_versao", "cenario workflow_resiliente", ct: ct);
+        s.WorkflowRuns.Add(fresh.WorkflowRunId);
+        newNodes = await NodesAsync(app, fresh.WorkflowRunId);
+
+        var unpinned = await CrashAfterAsync(app, s, "demo_resiliente_versao", "a", ct);
+        await app.Db.ExecAsync("update workflow_runs set definition = null where id = @id", ("id", unpinned));
+        await SaveDemoWorkflowAsync(app, "demo_resiliente_versao", TwoStepWorkflow);
+        await app.Workflows.RunAsync("", null, resumeRunId: unpinned, ct: ct);
+        unpinnedNodes = await NodesAsync(app, unpinned);
+        notPinned = await WorkflowEventsAsync(app, unpinned, WorkflowEvents.DefinitionNotPinned);
     }
 
     private sealed class CountingObserver : IRunObserver

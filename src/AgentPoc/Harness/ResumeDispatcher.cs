@@ -46,6 +46,16 @@ public sealed class RunExecutions
     }
 }
 
+/// <summary>Recuperacao de execucoes de workflow orfas (implementada pelo motor de workflow, sem o harness depender dele).</summary>
+public interface IWorkflowRecovery
+{
+    /// <summary>Execucoes running com lease vencido viram ready. Retorna quantas.</summary>
+    Task<int> RecoverOrphansAsync(string recoveredBy);
+
+    /// <summary>Reivindica uma execucao ready e a continua ate o fim. False se nao havia nenhuma.</summary>
+    Task<bool> ResumeNextAsync(CancellationToken ct);
+}
+
 /// <summary>Sinal para acordar quem espera (NOTIFY recebido), com tempo limite para a varredura periodica.</summary>
 internal sealed class Wakeup
 {
@@ -65,7 +75,8 @@ internal sealed class Wakeup
 /// run orfao (lease vencido porque a instancia dona caiu). Pega cada run com FOR UPDATE SKIP LOCKED e o marca
 /// running com o lease desta instancia no mesmo comando, entao varias instancias podem rodar o despachante sem
 /// retomar o mesmo run duas vezes. Acorda por LISTEN/NOTIFY e varre periodicamente: expira pedidos vencidos,
-/// recupera orfaos e reconcilia pais parados em filhos ja terminados.
+/// recupera orfaos e reconcilia pais parados em filhos ja terminados. Tambem retoma execucoes de workflow orfas,
+/// com um limite proprio de execucoes simultaneas.
 /// </summary>
 public sealed class ResumeDispatcher
 {
@@ -77,11 +88,15 @@ public sealed class ResumeDispatcher
     private readonly IHumanGate _human;
     private readonly Func<Guid?, IRunObserver?> _observerFor;
     private readonly RunLeaseOptions _lease;
+    private readonly IWorkflowRecovery? _workflows;
     private readonly Wakeup _wakeup = new();
 
+    private const int WorkflowConcurrency = 2;
+
     public ResumeDispatcher(Db db, AgentRunner runner, RunChain chain, IConversationHistory conversations, RunExecutions executions,
-                            IHumanGate human, Func<Guid?, IRunObserver?> observerFor, RunLeaseOptions lease)
+                            IHumanGate human, Func<Guid?, IRunObserver?> observerFor, RunLeaseOptions lease, IWorkflowRecovery? workflows = null)
     {
+        _workflows = workflows;
         _db = db;
         _runner = runner;
         _chain = chain;
@@ -100,6 +115,8 @@ public sealed class ResumeDispatcher
         await using var listener = await _db.ListenAsync(new[] { RunChain.ReadyChannel, RunChain.CancelChannel }, OnNotification, ct);
         Log.Write(0, ConsoleColor.DarkYellow, "despachante", $"{Name} ativo ({concurrency} em paralelo, varredura a cada {sweepInterval.TotalSeconds:0}s)");
         var workers = Enumerable.Range(0, Math.Max(1, concurrency)).Select(_ => Task.Run(() => WorkAsync(sweepInterval, ct), ct)).ToList();
+        if (_workflows != null)
+            workers.AddRange(Enumerable.Range(0, WorkflowConcurrency).Select(_ => Task.Run(() => WorkflowWorkAsync(_workflows, sweepInterval, ct), ct)));
         try
         {
             while (!ct.IsCancellationRequested)
@@ -117,7 +134,8 @@ public sealed class ResumeDispatcher
     {
         try
         {
-            var changed = await _chain.ExpireDueAsync() + await _chain.RecoverOrphansAsync(Name) + await _chain.ReconcileAsync();
+            var changed = await _chain.ExpireDueAsync() + await _chain.RecoverOrphansAsync(Name) + await _chain.ReconcileAsync() +
+                          (_workflows != null ? await _workflows.RecoverOrphansAsync(Name) : 0);
             if (changed > 0) _wakeup.Pulse();
         }
         catch (Exception ex)
@@ -157,6 +175,25 @@ public sealed class ResumeDispatcher
             catch (Exception ex)
             {
                 Log.Error($"despachante {Name}: {ex.Message}");
+            }
+        }
+    }
+
+    private async Task WorkflowWorkAsync(IWorkflowRecovery workflows, TimeSpan sweepInterval, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                if (!await workflows.ResumeNextAsync(ct)) await _wakeup.WaitAsync(sweepInterval, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"despachante {Name}: workflow: {ex.Message}");
             }
         }
     }

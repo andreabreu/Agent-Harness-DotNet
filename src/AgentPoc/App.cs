@@ -63,7 +63,7 @@ public sealed class App : IAsyncDisposable
         Executor = new ToolExecutor(Builtins, Mcp, Events);
         Runner = new AgentRunner(Db, Config, Registry, Executor, Events, runMessages, Chain, Lease, InstanceId);
         Builtins.Runner = Runner;
-        Workflows = new WorkflowEngine(Db, Runner);
+        Workflows = new WorkflowEngine(Db, Runner, Lease);
         Worker = new Worker(Db, Runner, Workflows);
         Evidence = new EvidenceWriter(Db);
         var human = new HumanInputStore(Db);
@@ -73,7 +73,7 @@ public sealed class App : IAsyncDisposable
         Feed = new ConversationFeed(Db);
         Chat = new ChatService(conversations, new ChatCompactor(Db, conversations, Config), Runner, Config, Memory, human, Chain, executions);
         Dispatcher = new ResumeDispatcher(Db, Runner, Chain, conversations, executions, HumanGate,
-            conversationId => conversationId == null ? null : new LiveObserver(Live), Lease);
+            conversationId => conversationId == null ? null : new LiveObserver(Live), Lease, Workflows);
     }
 
     public async ValueTask DisposeAsync()

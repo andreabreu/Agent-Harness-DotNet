@@ -166,6 +166,7 @@ Opcoes: `--approval auto|deny|ask`, `--budget <tokens>`.
 | `durabilidade_entrega` | Queda injetada (`AGENTPOC_FAULT`) dentro da transacao que conclui o filho e acorda o pai: nada fica pela metade, o lease vence, o filho e recuperado sem chamar o modelo de novo e o pai termina com um unico `tool_result`; pai preso forjado no banco e corrigido pela reconciliacao |
 | `workflow_aprovacao` | Workflow sem modo informado nega `run_shell` (no de ferramenta e subagente), modo `auto` explicito executa, `tools.allow` libera, `tools.block` bloqueia ferramenta `auto`, `deny_when` vence o `allow`, tarefa da fila criada no workflow herda o padrao no worker, regra com ferramenta inexistente impede o inicio; cada decisao grava a origem |
 | `workflow_desvio` | Triagem: classificador com `output_schema` (nova tentativa quando erra o formato), desvio com 3 casos e `default`, ramos pulados, join `all_active`, join `any`, `transform` com tipos preservados, `end` com falha, entrada fora do `input_schema` e definicao invalida rejeitadas, queda depois do desvio retomada sem reclassificar |
+| `workflow_resiliente` | Execucao com dono morto (lease vencido, forjada) recuperada pelo despachante sem repetir o no pronto; `--resume` recusado com dono vivo; versao fixa (definicao trocada no meio, a retomada termina na antiga, a nova execucao usa a nova); execucao sem copia usa a atual com `definition_not_pinned` |
 | `chat` | Conversa de 5 turnos: pesquisa na web, plano + delegacao, resposta pelo historico, aprovacao negada, ferramentas persistidas, streaming e compactacao em resumo |
 
 ## Como funciona
@@ -176,8 +177,8 @@ src/AgentPoc/
   Harness/ToolExecutor.cs   politica auto/approval/deny (+ regras por argumento) + execucao + auditoria
   Harness/RunChain.cs       transicoes duraveis entre runs: fim + entrega filho -> pai numa transacao, ready,
                             orfaos por lease, reconciliacao, expiracao, cancelamento
-  Harness/ResumeDispatcher.cs  retoma runs ready (SKIP LOCKED, LISTEN/NOTIFY, varredura)
-  Harness/RunLease.cs       lease por run + heartbeat
+  Harness/ResumeDispatcher.cs  retoma runs ready e execucoes de workflow orfas (SKIP LOCKED, LISTEN/NOTIFY, varredura)
+  Harness/RunLease.cs       lease por run e por execucao de workflow + heartbeat
   Harness/ToolRecovery.cs   idempotencia de ferramenta na retomada (repetir / perguntar)
   Human/                    pedidos humanos (approvals) e o gate duravel
   Tools/BuiltinTools.cs     search_tools, delegate_task, create_task, memoria, KB, arquivos, shell, web
@@ -228,6 +229,19 @@ sql/schema.sql, seed.sql    tudo que define comportamento
   - *Retomada*: o desvio escolhido fica em `workflow_node_runs.chosen_next`; o `--resume` rele a escolha e os
     pulados, sem chamar o classificador de novo.
   - *Entrada e saida*: `input_schema` valida a entrada (JSON) antes de iniciar; `output` define a saida final.
+- **Workflow resiliente**:
+  - *Lease por execucao*: `workflow_runs` tem `owner` e `lease_until`, renovados pelo mesmo heartbeat dos runs
+    (`RUN_LEASE_SECONDS`). Se a instancia cai, a varredura do despachante (`serve`, `chat`, `dispatcher`) passa a
+    execucao para `ready` (evento `workflow_recovered` em `workflow_events`, com o dono anterior e o novo) e uma
+    instancia a reivindica com `FOR UPDATE SKIP LOCKED` e continua. `workflow --resume` continua valendo, mas e
+    recusado enquanto outra instancia tem lease valido.
+  - *No interrompido*: o run do agente guarda o no que o criou (`runs.workflow_node_id`). Na retomada, um run ja
+    terminado tem o resultado usado; um run orfao e assumido e continua do historico (o MESMO run, sem chamar o
+    modelo do zero); sem run, o no executa de novo. Um no `tool` usa ids estaveis por tentativa: resultado gravado
+    e reaproveitado, e uma chamada com efeito interrompida nao repete sozinha (sem ninguem para responder, pula).
+  - *Versao fixa*: cada execucao guarda a copia da definicao (`workflow_runs.definition`); a retomada e as tarefas
+    da fila criadas no workflow usam essa copia. Execucao antiga sem copia usa a atual e registra
+    `definition_not_pinned`.
 - **Suspensao duravel**: um run pode parar sem processo preso (`waiting_human`, `waiting_child`), com todo o
   historico no banco. Qualquer instancia com o despachante retoma o mesmo run quando ele fica `ready`.
   Estados: `running` -> `waiting_human` | `waiting_child` -> `ready` -> `running` -> `completed`/... ;
@@ -317,6 +331,12 @@ Com desvio condicional (spec 002): 14 cenarios, 99/99 checagens (inclui `workflo
 `tests/run_restart.sh` e `tests/hitl_restart.sh` OK; `workflow`, `retomada` e `workflow_aprovacao` iguais com o motor
 refeito em volta do escalonador. Testes unitarios: 166.
 
+Com retomada automatica e versao fixa de workflows (spec 003, US1 e US2): 15 cenarios, 105/105 checagens (inclui
+`workflow_resiliente`, 6/6); `tests/workflow_restart.sh` com `kill -9` de verdade (agente de um no retomado no
+MESMO run por um `dispatcher` em outro processo; `run_shell` de um no `tool` nao repete; dois `dispatcher`
+disputando tres execucoes orfas sem duplicar); `tests/run_restart.sh` e `tests/hitl_restart.sh` OK. Testes
+unitarios: 175.
+
 Nao testado: contra o Azure Foundry real (inclusive `stream_options` e `reasoning_effort` no deployment)
 e a Brave Search API. O primeiro `dotnet run -- check` com o `.env` preenchido confirma o modelo.
 
@@ -327,8 +347,9 @@ e a Brave Search API. O primeiro `dotnet run -- check` com o `.env` preenchido c
 - O budget e checado entre chamadas ao modelo, entao um run pode passar do limite em uma chamada.
 - Na CLI a aprovacao e por terminal ou pelo modo global (`APPROVAL_MODE`); no worker o modo `ask` pausa tudo.
 - Sem multi-tenant e sem autenticacao: o `serve` escuta so em localhost.
-- Recuperacao de orfaos so para runs de conversa (`conversation_id`). Runs de `task`, `worker` e nos de
-  workflow tambem tem lease, mas continuam com a recuperacao propria (retentativa da fila, `workflow --resume`).
+- Recuperacao de orfaos pelo despachante para runs de conversa (`conversation_id`) e execucoes de workflow (o run
+  do agente de um no e retomado pelo motor). Runs de `task` e `worker` tambem tem lease, mas continuam com a
+  retentativa da fila.
 - A recuperacao demora ate o lease vencer mais uma varredura (padrao ate ~80 s). Lease curto recupera rapido,
   mas um run que trava sem heartbeat (ex.: processo congelado) e tomado por outra instancia; a antiga para ao
   perceber que perdeu a posse, mas pode ter feito UMA chamada externa nesse intervalo.
@@ -343,9 +364,11 @@ e a Brave Search API. O primeiro `dotnet run -- check` com o `.env` preenchido c
 - Tarefas da fila (`worker`) e nos de workflow ainda nao esperam pessoa. A fila usa o modo de aprovacao da CLI
   (`APPROVAL_MODE`, padrao `auto` no `serve`), exceto tarefas criadas dentro de um workflow, que usam o modo da
   execucao (padrao `deny`). Tarefas criadas pelo chat continuam no modo da CLI do worker.
-- As regras `tools.allow`/`tools.block` vem da definicao atual do workflow, inclusive no `--resume` (a definicao
-  nao e fixada por execucao); nem elas nem o modo sao gravados no run do agente. Quando um no puder esperar uma
-  pessoa de forma duravel, o run retomado precisara recebe-los.
+- O modo e as regras `tools.allow`/`tools.block` vem da execucao (copia da definicao), nao do run do agente;
+  quem retoma o run de um no e o motor, que os repassa. Quando um no puder esperar uma pessoa de forma duravel
+  (spec 004), o run retomado direto pelo despachante precisara recebe-los.
+- No `tool` com efeito interrompido por queda resolve como pular (registrado em `tool_call_recovered`), porque o
+  gate de workflow nao tem pessoa para responder; a pergunta duravel vem com a spec 004.
 - Condicoes nao tem aritmetica nem funcoes (so comparacoes e combinacoes); a saida estruturada vem do prompt e da
   validacao local, sem o `response_format` do provedor; nos prontos rodam em lotes (um no `any` espera o lote
   inteiro terminar, nao so o primeiro antecessor).
