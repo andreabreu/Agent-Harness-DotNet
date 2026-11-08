@@ -52,6 +52,11 @@ public static class Demo
         ("hitl_cancela", "Cancelar o agente raiz cancela a cadeia suspensa inteira",
             "Com o subagente esperando uma pessoa, o cancelamento do turno marca raiz e filho como cancelled, fecha o pedido " +
             "pendente e nada e retomado depois.", new ScenarioFn(HitlCancela)),
+        ("durabilidade_entrega", "Entrega filho -> pai atomica, recuperacao por lease e reconciliacao",
+            "Uma queda e injetada no meio da transacao que conclui o filho e acorda o pai: nada fica gravado pela metade. O lease " +
+            "do filho vence, outra varredura o recupera (run_recovered), ele conclui com a resposta ja gravada (sem chamar o modelo " +
+            "de novo) e o pai termina com um unico tool_result. Um pai deixado em waiting_child com o filho ja terminado (o estado " +
+            "que a versao anterior podia produzir) e corrigido pela reconciliacao do despachante.", new ScenarioFn(DurabilidadeEntrega)),
     };
 
     private static readonly TimeSpan DemoDispatcherSweep = TimeSpan.FromSeconds(1);
@@ -554,6 +559,79 @@ public static class Demo
         s.Checks.Add(new Check("Pedido pendente foi fechado (expired, motivo cancelamento)", _ => closed?.Status == "expired" && closed.Reason!.Contains("cancelado")));
         s.Checks.Add(new Check("Nada foi retomado depois do cancelamento", _ => resumed == 0));
     });
+
+    /// <summary>Lease curto so neste cenario, para o run "caido" virar orfao em segundos.</summary>
+    private static readonly RunLeaseOptions ShortLease = new(TimeSpan.FromSeconds(2), TimeSpan.FromMilliseconds(500));
+
+    private static async Task DurabilidadeEntrega(App app, EvidenceSession s, CancellationToken ct)
+    {
+        await using var instance = new App(app.ConnectionString, ShortLease);
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var dispatcher = Task.Run(() => instance.Dispatcher.RunAsync(2, instance.Lease.Sweep, stop.Token));
+        try
+        {
+            await InjectedFaultPartAsync(instance, s, ct);
+            await ReconciliationPartAsync(instance, s, ct);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(FaultInjection.Variable, null);
+            stop.Cancel();
+            try { await dispatcher; } catch (OperationCanceledException) { /* encerrado */ }
+        }
+    }
+
+    private static async Task<int> DelegateToolResultsAsync(App app, Guid conversation) =>
+        Convert.ToInt32(await app.Db.ScalarAsync(
+            "select count(*) from conversation_messages where conversation_id = @c and role = 'tool' and tool_name = 'delegate_task'", ("c", conversation)));
+
+    private static async Task InjectedFaultPartAsync(App instance, EvidenceSession s, CancellationToken ct)
+    {
+        var (conversation, root, request) = await SuspendedSubagentAsync(instance, s, ct);
+        var childId = request.RunId;
+        Environment.SetEnvironmentVariable(FaultInjection.Variable, FaultInjection.AfterChildFinished);
+        s.Notes.Add($"Parte 1: {FaultInjection.Variable}={FaultInjection.AfterChildFinished} ligado; a queda acontece dentro da transacao que conclui o filho.");
+        await instance.Chat.DecideAsync(request.Id, new HumanDecision(null, null, null, "producao"));
+
+        while (Environment.GetEnvironmentVariable(FaultInjection.Variable) != null) await Task.Delay(50, ct);
+        var afterFault = await instance.Db.QueryOneAsync("select status, owner from runs where id = @id", ("id", childId));
+        var parentAfterFault = await RunStatusAsync(instance, root.RunId);
+        var deliveredAfterFault = await DelegateToolResultsAsync(instance, conversation);
+        Log.Warn($"Queda injetada: filho continua {afterFault?.S("status")} (dono {afterFault?.S("owner")}), pai {parentAfterFault}, tool_results entregues {deliveredAfterFault}.");
+
+        var final = await instance.Chain.WaitUntilSettledAsync(root.RunId, SettleTimeout, ct);
+        Log.Write(0, ConsoleColor.Green, final.Status, final.Output);
+        var recovered = await instance.Db.QueryOneAsync(
+            "select data->>'previous_owner' as previous, data->>'recovered_by' as by from run_events where run_id = @id and type = 'run_recovered'", ("id", childId));
+        var childLlmCalls = await CountEventsAsync(instance, childId, "llm_call");
+        var delivered = await DelegateToolResultsAsync(instance, conversation);
+
+        s.Checks.Add(new Check("Queda dentro da transacao nao gravou nada pela metade: filho ainda running e pai ainda waiting_child, sem tool_result",
+            _ => afterFault?.S("status") == RunStatus.Running && parentAfterFault == RunStatus.WaitingChild && deliveredAfterFault == 0));
+        s.Checks.Add(new Check("Lease do filho venceu e a varredura o recuperou (run_recovered com a instancia anterior)",
+            _ => recovered != null && recovered.S("previous") == instance.InstanceId));
+        s.Checks.Add(new Check("Filho concluiu com a resposta ja gravada, sem chamar o modelo de novo (2 chamadas: pergunta e resposta)",
+            _ => childLlmCalls == 2));
+        s.Checks.Add(new Check("Pai terminou com a resposta do filho", _ => final.Status == RunStatus.Completed && final.Output.Contains("producao")));
+        s.Checks.Add(new Check("O tool_result do delegate_task foi gravado uma unica vez no pai", _ => delivered == 1));
+    }
+
+    private static async Task ReconciliationPartAsync(App instance, EvidenceSession s, CancellationToken ct)
+    {
+        var (conversation, root, request) = await SuspendedSubagentAsync(instance, s, ct);
+        s.Notes.Add("Parte 2: estado da versao anterior forjado no banco (filho completed, pai preso em waiting_child sem tool_result).");
+        await instance.Db.ExecAsync("update approvals set status = 'answered', answer = 'homologacao', decided_at = now() where id = @id", ("id", request.Id));
+        await instance.Db.ExecAsync(
+            "update runs set status = 'completed', output = 'A pessoa escolheu o ambiente: homologacao', finished_at = now() where id = @id",
+            ("id", request.RunId));
+        var final = await instance.Chain.WaitUntilSettledAsync(root.RunId, SettleTimeout, ct);
+        var delivered = await DelegateToolResultsAsync(instance, conversation);
+        Log.Write(0, ConsoleColor.Green, final.Status, final.Output);
+
+        s.Checks.Add(new Check("Reconciliacao: pai preso com filho terminado recebeu o resultado e terminou",
+            _ => final.Status == RunStatus.Completed && final.Output.Contains("homologacao")));
+        s.Checks.Add(new Check("Reconciliacao gravou o tool_result uma unica vez", _ => delivered == 1));
+    }
 
     private sealed class CountingObserver : IRunObserver
     {

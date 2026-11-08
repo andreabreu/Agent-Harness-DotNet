@@ -380,6 +380,13 @@ function handleEvent(t, type, evt) {
       addRow(t, `${who}▶ retomado por <code>${esc(evt.by)}</code>`);
       setRunning(true);
       break;
+    case "run_recovered":
+      addRow(t, `${who}♻ recuperado de <code>${esc(evt.previous_owner)}</code> (instância caiu) por <code>${esc(evt.recovered_by)}</code>`);
+      setRunning(true);
+      break;
+    case "tool_call_recovered":
+      addRow(t, `${who}♻ ${esc(evt.name)} interrompida pela queda: ${esc(evt.decision)}`);
+      break;
     case "run_finished":
       if (!root) break;
       closeTurn(t, evt);
@@ -393,7 +400,7 @@ function handleEvent(t, type, evt) {
 
 const STREAM_EVENTS = ["text", "reasoning", "assistant_message", "thinking", "plan_updated", "tools_loaded", "delegation_start",
   "delegation_end", "task_created", "policy", "approval_request", "budget_exceeded", "error", "cancelled", "llm_call", "tool_call",
-  "tool_result", "waiting_human", "waiting_child", "run_resumed", "run_finished"];
+  "tool_result", "waiting_human", "waiting_child", "run_resumed", "run_recovered", "tool_call_recovered", "run_finished"];
 
 function currentTurn() {
   if (!state.turn) state.turn = newTurn();

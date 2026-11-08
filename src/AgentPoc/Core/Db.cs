@@ -8,8 +8,17 @@ namespace AgentPoc.Core;
 /// <summary>Valor a ser enviado como jsonb a partir de uma string JSON.</summary>
 public sealed record Jsonb(string Json);
 
+/// <summary>Executa SQL no banco direto ou dentro de uma transacao (mesma API nos dois casos).</summary>
+public interface IDbExecutor
+{
+    Task<int> ExecAsync(string sql, params (string Name, object? Value)[] ps);
+    Task<object?> ScalarAsync(string sql, params (string Name, object? Value)[] ps);
+    Task<List<Dictionary<string, object?>>> QueryAsync(string sql, params (string Name, object? Value)[] ps);
+    Task<Dictionary<string, object?>?> QueryOneAsync(string sql, params (string Name, object? Value)[] ps);
+}
+
 /// <summary>Acesso minimo ao Postgres (Npgsql puro, sem ORM).</summary>
-public sealed class Db : IAsyncDisposable
+public sealed class Db : IDbExecutor, IAsyncDisposable
 {
     private readonly NpgsqlDataSource _ds;
 
@@ -18,8 +27,9 @@ public sealed class Db : IAsyncDisposable
         _ds = NpgsqlDataSource.Create(connectionString);
     }
 
-    private static void Bind(NpgsqlCommand cmd, (string Name, object? Value)[] ps)
+    private static NpgsqlCommand Command(string sql, NpgsqlConnection conn, NpgsqlTransaction? tx, (string Name, object? Value)[] ps)
     {
+        var cmd = new NpgsqlCommand(sql, conn, tx);
         foreach (var (name, value) in ps)
         {
             NpgsqlParameter p = value switch
@@ -31,30 +41,11 @@ public sealed class Db : IAsyncDisposable
             };
             cmd.Parameters.Add(p);
         }
+        return cmd;
     }
 
-    public async Task<int> ExecAsync(string sql, params (string Name, object? Value)[] ps)
+    private static async Task<List<Dictionary<string, object?>>> ReadAsync(NpgsqlCommand cmd)
     {
-        await using var conn = await _ds.OpenConnectionAsync();
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        Bind(cmd, ps);
-        return await cmd.ExecuteNonQueryAsync();
-    }
-
-    public async Task<object?> ScalarAsync(string sql, params (string Name, object? Value)[] ps)
-    {
-        await using var conn = await _ds.OpenConnectionAsync();
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        Bind(cmd, ps);
-        var v = await cmd.ExecuteScalarAsync();
-        return v is DBNull ? null : v;
-    }
-
-    public async Task<List<Dictionary<string, object?>>> QueryAsync(string sql, params (string Name, object? Value)[] ps)
-    {
-        await using var conn = await _ds.OpenConnectionAsync();
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        Bind(cmd, ps);
         await using var reader = await cmd.ExecuteReaderAsync();
         var rows = new List<Dictionary<string, object?>>();
         while (await reader.ReadAsync())
@@ -67,8 +58,74 @@ public sealed class Db : IAsyncDisposable
         return rows;
     }
 
+    public async Task<int> ExecAsync(string sql, params (string Name, object? Value)[] ps)
+    {
+        await using var conn = await _ds.OpenConnectionAsync();
+        await using var cmd = Command(sql, conn, null, ps);
+        return await cmd.ExecuteNonQueryAsync();
+    }
+
+    public async Task<object?> ScalarAsync(string sql, params (string Name, object? Value)[] ps)
+    {
+        await using var conn = await _ds.OpenConnectionAsync();
+        await using var cmd = Command(sql, conn, null, ps);
+        var v = await cmd.ExecuteScalarAsync();
+        return v is DBNull ? null : v;
+    }
+
+    public async Task<List<Dictionary<string, object?>>> QueryAsync(string sql, params (string Name, object? Value)[] ps)
+    {
+        await using var conn = await _ds.OpenConnectionAsync();
+        await using var cmd = Command(sql, conn, null, ps);
+        return await ReadAsync(cmd);
+    }
+
     public async Task<Dictionary<string, object?>?> QueryOneAsync(string sql, params (string Name, object? Value)[] ps) =>
         (await QueryAsync(sql, ps)).FirstOrDefault();
+
+    /// <summary>Roda <paramref name="work"/> numa unica transacao: tudo grava junto ou nada grava (rollback em excecao).</summary>
+    public async Task<T> InTransactionAsync<T>(Func<IDbExecutor, Task<T>> work)
+    {
+        await using var conn = await _ds.OpenConnectionAsync();
+        await using var tx = await conn.BeginTransactionAsync();
+        var result = await work(new Transaction(conn, tx));
+        await tx.CommitAsync();
+        return result;
+    }
+
+    private sealed class Transaction : IDbExecutor
+    {
+        private readonly NpgsqlConnection _conn;
+        private readonly NpgsqlTransaction _tx;
+
+        public Transaction(NpgsqlConnection conn, NpgsqlTransaction tx)
+        {
+            _conn = conn;
+            _tx = tx;
+        }
+
+        public async Task<int> ExecAsync(string sql, params (string Name, object? Value)[] ps)
+        {
+            await using var cmd = Command(sql, _conn, _tx, ps);
+            return await cmd.ExecuteNonQueryAsync();
+        }
+
+        public async Task<object?> ScalarAsync(string sql, params (string Name, object? Value)[] ps)
+        {
+            await using var cmd = Command(sql, _conn, _tx, ps);
+            var v = await cmd.ExecuteScalarAsync();
+            return v is DBNull ? null : v;
+        }
+
+        public async Task<List<Dictionary<string, object?>>> QueryAsync(string sql, params (string Name, object? Value)[] ps)
+        {
+            await using var cmd = Command(sql, _conn, _tx, ps);
+            return await ReadAsync(cmd);
+        }
+
+        public async Task<Dictionary<string, object?>?> QueryOneAsync(string sql, params (string Name, object? Value)[] ps) =>
+            (await QueryAsync(sql, ps)).FirstOrDefault();
+    }
 
     public Task NotifyAsync(string channel, string payload) =>
         ExecAsync("select pg_notify(@ch, @p)", ("ch", channel), ("p", payload));

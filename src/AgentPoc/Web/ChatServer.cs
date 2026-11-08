@@ -27,7 +27,6 @@ public sealed class ChatServer
     private const int DispatcherConcurrency = 2;
     private const int ConversationsListed = 50;
     private const string DefaultAgent = "assistant";
-    private static readonly TimeSpan DispatcherSweep = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan StreamPollInterval = TimeSpan.FromMilliseconds(250);
 
     private readonly App _app;
@@ -52,7 +51,7 @@ public sealed class ChatServer
         var stopping = web.Lifetime.ApplicationStopping;
         var workers = Task.Run(() => _app.Worker.RunAsync(BackgroundWorkers, untilEmpty: false, stopping));
         var dispatcher = startDispatcher
-            ? Task.Run(() => _app.Dispatcher.RunAsync(DispatcherConcurrency, DispatcherSweep, stopping))
+            ? Task.Run(() => _app.Dispatcher.RunAsync(DispatcherConcurrency, _app.Lease.Sweep, stopping))
             : Task.CompletedTask;
         Log.Ok($"Chat web em http://localhost:{port} (Ctrl+C encerra)");
         await web.RunAsync(ct);

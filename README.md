@@ -162,6 +162,7 @@ Opcoes: `--approval auto|deny|ask`, `--budget <tokens>`.
 | `hitl_concorrencia` | 4 cadeias suspensas, duas instancias com despachante: cada run retomado uma vez, sem eventos duplicados |
 | `hitl_expira` | Pedido vencido: negado como `expired`, o subagente replaneja e o pai termina |
 | `hitl_cancela` | Cancelar o raiz com subagente suspenso: toda a cadeia `cancelled`, pedido fechado, nada retomado |
+| `durabilidade_entrega` | Queda injetada (`AGENTPOC_FAULT`) dentro da transacao que conclui o filho e acorda o pai: nada fica pela metade, o lease vence, o filho e recuperado sem chamar o modelo de novo e o pai termina com um unico `tool_result`; pai preso forjado no banco e corrigido pela reconciliacao |
 | `chat` | Conversa de 5 turnos: pesquisa na web, plano + delegacao, resposta pelo historico, aprovacao negada, ferramentas persistidas, streaming e compactacao em resumo |
 
 ## Como funciona
@@ -170,8 +171,11 @@ Opcoes: `--approval auto|deny|ask`, `--budget <tokens>`.
 src/AgentPoc/
   Harness/AgentRunner.cs    o loop do agente, budget, compactacao de contexto, eventos, suspensao e retomada
   Harness/ToolExecutor.cs   politica auto/approval/deny (+ regras por argumento) + execucao + auditoria
-  Harness/RunChain.cs       transicoes duraveis entre runs: ready, entrega filho -> pai, expiracao, cancelamento
+  Harness/RunChain.cs       transicoes duraveis entre runs: fim + entrega filho -> pai numa transacao, ready,
+                            orfaos por lease, reconciliacao, expiracao, cancelamento
   Harness/ResumeDispatcher.cs  retoma runs ready (SKIP LOCKED, LISTEN/NOTIFY, varredura)
+  Harness/RunLease.cs       lease por run + heartbeat
+  Harness/ToolRecovery.cs   idempotencia de ferramenta na retomada (repetir / perguntar)
   Human/                    pedidos humanos (approvals) e o gate duravel
   Tools/BuiltinTools.cs     search_tools, delegate_task, create_task, memoria, KB, arquivos, shell, web
   Tools/HttpTool.cs         executor generico de ferramentas HTTP definidas so no banco
@@ -200,6 +204,25 @@ sql/schema.sql, seed.sql    tudo que define comportamento
   historico no banco. Qualquer instancia com o despachante retoma o mesmo run quando ele fica `ready`.
   Estados: `running` -> `waiting_human` | `waiting_child` -> `ready` -> `running` -> `completed`/... ;
   suspensos podem ir direto para `cancelled`.
+- **Execucao duravel** (sem Temporal):
+  - *Entrega atomica*: o fim de um run, a gravacao da saida como `tool_result` do `delegate_task` no pai e a
+    passagem do pai para `ready` acontecem numa unica transacao (filho `failed`/`cancelled` chega como erro da
+    ferramenta). Uma queda no meio desfaz tudo; nao existe pai preso com filho concluido. Por garantia, a
+    varredura do despachante ainda reconcilia qualquer pai em `waiting_child` cujo filho ja terminou.
+  - *Lease por run*: ao ir para `running`, o run ganha `owner` (a instancia) e `lease_until`, renovado por
+    heartbeat enquanto o modelo ou uma ferramenta executa (`RUN_LEASE_SECONDS`, padrao 60; `RUN_HEARTBEAT_SECONDS`,
+    padrao 1/3 do lease). Run de conversa com lease vencido e orfao: a varredura o devolve para `ready` com o
+    evento `run_recovered` (instancia anterior e nova) e ele e retomado do historico persistido. So o dono do
+    lease grava resultado e mensagens; quem perde o lease para sem escrever. A conversa nunca fica "ocupada"
+    para sempre: com o dono morto, o turno e recuperado e a tela segue o stream.
+  - *Idempotencia de ferramenta*: antes de executar, grava `tool_call_started`. Na retomada, uma chamada que
+    comecou e nao gravou resultado e repetida se a ferramenta e `side_effect = false` (leitura, busca, think,
+    plano, `wait_seconds`; `delegate_task` e `ask_human` sao idempotentes pela tool call); com efeito
+    (`run_shell`, `write_file`, `delete_file`, `create_task`, HTTP/MCP sem marcacao) nao repete sozinha: vira
+    um pedido humano duravel "repetir, pular ou informar o resultado". `side_effect` tem padrao `true` (seguro).
+  - *Delegacao idempotente*: o filho guarda `parent_tool_call_id`; retomar o pai reaproveita o filho ja criado
+    (terminado: usa o resultado; andando: o pai espera por ele) em vez de criar outro.
+  - Um run que caiu depois de gravar a resposta final conclui com ela, sem chamar o modelo de novo.
 
 ## Configurando pelo banco (sem recompilar)
 
@@ -248,6 +271,11 @@ subagente pendente, processo novo responde e termina a cadeia); tela servida por
 despachante mostrando a retomada feita por outro processo (`dispatcher`); `chat` no terminal com decisao no
 prompt. Testes unitarios: 52.
 
+Com a execucao duravel: 12 cenarios, 76/76 checagens (inclui `durabilidade_entrega`: queda injetada dentro
+da transacao de entrega e reconciliacao); `tests/run_restart.sh` com `kill -9` de verdade (chamada lenta
+recuperada por outra instancia; `run_shell` interrompido nao repete e vira pergunta; dois processos
+`dispatcher` disputando orfaos sem duplicar). Testes unitarios: 71.
+
 Nao testado: contra o Azure Foundry real (inclusive `stream_options` e `reasoning_effort` no deployment)
 e a Brave Search API. O primeiro `dotnet run -- check` com o `.env` preenchido confirma o modelo.
 
@@ -258,13 +286,17 @@ e a Brave Search API. O primeiro `dotnet run -- check` com o `.env` preenchido c
 - O budget e checado entre chamadas ao modelo, entao um run pode passar do limite em uma chamada.
 - Na CLI a aprovacao e por terminal ou pelo modo global (`APPROVAL_MODE`); no worker o modo `ask` pausa tudo.
 - Sem multi-tenant e sem autenticacao: o `serve` escuta so em localhost.
-- Espera humana e duravel, mas a EXECUCAO nao: se uma instancia cair enquanto um run esta `running` (gerando
-  com o modelo ou rodando ferramenta), ele fica `running` sem dono. Falta lease/heartbeat por run para outra
-  instancia reivindica-lo; hoje a mensagem nova na conversa responde "ocupado" ate alguem marcar o run.
-- Ferramentas reexecutadas na retomada sao so as que ainda nao tinham resultado; nao ha idempotencia para uma
-  ferramenta que chegou a executar mas o processo caiu antes de gravar o resultado.
-- Ha uma janela de milissegundos na entrega filho -> pai (resultado gravado, pai ainda nao `ready`); uma queda
-  exatamente ali deixa o pai em `waiting_child` sem filho; a varredura nao recupera esse caso.
+- Recuperacao de orfaos so para runs de conversa (`conversation_id`). Runs de `task`, `worker` e nos de
+  workflow tambem tem lease, mas continuam com a recuperacao propria (retentativa da fila, `workflow --resume`).
+- A recuperacao demora ate o lease vencer mais uma varredura (padrao ate ~80 s). Lease curto recupera rapido,
+  mas um run que trava sem heartbeat (ex.: processo congelado) e tomado por outra instancia; a antiga para ao
+  perceber que perdeu a posse, mas pode ter feito UMA chamada externa nesse intervalo.
+- `side_effect` e por ferramenta, nao por argumento: `http_get` e tratado como leitura mesmo que a URL dispare
+  algo no destino. Ferramenta nova sem marcacao e tratada como efeito (pergunta antes de repetir).
+- O processo que cai pode deixar processos filhos rodando (ex.: o shell de um `run_shell`); a retomada nao os
+  encerra, so evita repetir a chamada.
+- A posse e conferida antes de cada mensagem gravada, mas nao numa mesma transacao com a gravacao: ha uma janela
+  pequena em que uma instancia que acabou de perder o lease grava uma ultima mensagem.
 - Texto token a token so aparece quando o run executa no mesmo processo que serve a tela; de outra instancia,
   por mensagem completa. O stream da tela le o banco a cada 250 ms.
 - Tarefas da fila (`worker`) e nos de workflow ainda nao esperam pessoa: usam o modo de aprovacao da CLI

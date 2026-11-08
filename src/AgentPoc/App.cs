@@ -36,13 +36,20 @@ public sealed class App : IAsyncDisposable
 
     public string ConnectionString { get; }
 
+    /// <summary>Lease dos runs em execucao (RUN_LEASE_SECONDS / RUN_HEARTBEAT_SECONDS).</summary>
+    public RunLeaseOptions Lease { get; }
+
+    /// <summary>Identidade desta instancia: dona dos runs que executa e nome do despachante.</summary>
+    public string InstanceId { get; } = $"{Environment.MachineName}-{Environment.ProcessId}-{Guid.NewGuid().ToString("N")[..4]}";
+
     /// <summary>Prazo para uma pessoa responder um pedido (HITL_EXPIRES_HOURS); vencido, o pedido e negado como expired.</summary>
     private static TimeSpan HumanRequestExpiry =>
         TimeSpan.FromHours(double.TryParse(Env.Get("HITL_EXPIRES_HOURS"), System.Globalization.CultureInfo.InvariantCulture, out var h) ? h : 24);
 
-    public App(string connectionString)
+    public App(string connectionString, RunLeaseOptions? lease = null)
     {
         ConnectionString = connectionString;
+        Lease = lease ?? RunLeaseOptions.FromEnv();
         Db = new Db(connectionString);
         Config = new ConfigRepo(Db);
         Registry = new ToolRegistry(Db);
@@ -51,10 +58,10 @@ public sealed class App : IAsyncDisposable
         Memory = new MemoryStore(Db);
         var runMessages = new RunMessageStore(Db);
         var conversations = new ConversationStore(Db);
-        Chain = new RunChain(Db, Events, runMessages, conversations);
+        Chain = new RunChain(Db, Events, conversations);
         Builtins = new BuiltinTools(Db, Registry, Config, Events, Memory);
         Executor = new ToolExecutor(Builtins, Mcp, Events);
-        Runner = new AgentRunner(Db, Config, Registry, Executor, Events, runMessages, Chain);
+        Runner = new AgentRunner(Db, Config, Registry, Executor, Events, runMessages, Chain, Lease, InstanceId);
         Builtins.Runner = Runner;
         Workflows = new WorkflowEngine(Db, Runner);
         Worker = new Worker(Db, Runner);
@@ -66,7 +73,7 @@ public sealed class App : IAsyncDisposable
         Feed = new ConversationFeed(Db);
         Chat = new ChatService(conversations, new ChatCompactor(Db, conversations, Config), Runner, Config, Memory, human, Chain, executions);
         Dispatcher = new ResumeDispatcher(Db, Runner, Chain, conversations, executions, HumanGate,
-            conversationId => conversationId == null ? null : new LiveObserver(Live));
+            conversationId => conversationId == null ? null : new LiveObserver(Live), Lease);
     }
 
     public async ValueTask DisposeAsync()

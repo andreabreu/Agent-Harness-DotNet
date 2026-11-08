@@ -39,6 +39,7 @@ public sealed class BuiltinTools
         "search_tools" => SearchTools(args, ctx),
         "ask_human" => AskHuman(args, ctx, callId, ct),
         "think" => Think(args, ctx),
+        "wait_seconds" => WaitSeconds(args, ct),
         "update_plan" => UpdatePlan(args, ctx),
         "web_search" => WebSearchTool(args, ct),
         "list_agents" => ListAgents(ctx),
@@ -101,6 +102,15 @@ public sealed class BuiltinTools
         return answer.StartsWith("SEM RESPOSTA", StringComparison.Ordinal) ? answer : $"Resposta da pessoa: {answer}";
     }
 
+    private const int MaxWaitSeconds = 60;
+
+    private static async Task<string> WaitSeconds(JsonObject args, CancellationToken ct)
+    {
+        var seconds = Math.Clamp(ArgInt(args, "seconds", 1), 1, MaxWaitSeconds);
+        await Task.Delay(TimeSpan.FromSeconds(seconds), ct);
+        return $"Esperei {seconds} segundos.";
+    }
+
     private async Task<string> UpdatePlan(JsonObject args, RunContext ctx)
     {
         if (args["steps"] is not JsonArray steps || steps.Count == 0) return "ERRO: informe steps com ao menos um passo.";
@@ -145,8 +155,11 @@ public sealed class BuiltinTools
         if (ctx.Depth + 1 > AgentRunner.MaxDepth) return $"ERRO: profundidade maxima de delegacao ({AgentRunner.MaxDepth}) atingida. Faca a tarefa voce mesmo.";
         if (Runner == null) return "ERRO: runner nao configurado.";
 
+        if (await ExistingChildAsync(ctx, callId) is { } existing) return await AdoptChildAsync(ctx, existing, callId);
+
         await _events.AddAsync(ctx, "delegation_start", new JsonObject { ["to_agent"] = agentId, ["task"] = Text.Trunc(task, 1500) });
-        var child = await Runner.RunAsync(agentId, task, parent: ctx, ct: ct);
+        var child = await Runner.RunAsync(agentId, task, parent: ctx, parentToolCallId: callId, ct: ct);
+        if (child.Status == AgentRunner.LeaseLostStatus) throw new LeaseLostException(ctx.RunId);
         if (RunStatus.IsSuspended(child.Status))
             throw new ChildSuspendedException(child.RunId, agentId, callId);
 
@@ -158,6 +171,30 @@ public sealed class BuiltinTools
             ["tokens"] = child.TokensIn + child.TokensOut
         });
         return DelegationResult.Format(agentId, child.Status, child.Steps, child.Output);
+    }
+
+    /// <summary>Filho ja criado por esta mesma chamada delegate_task (retomada depois de uma queda).</summary>
+    private Task<Dictionary<string, object?>?> ExistingChildAsync(RunContext ctx, string callId) =>
+        _db.QueryOneAsync(
+            @"select id, agent_id, status, output, steps, tokens_in + tokens_out as tokens from runs
+               where parent_run_id = @p and parent_tool_call_id = @c order by started_at desc limit 1",
+            ("p", ctx.RunId), ("c", callId));
+
+    /// <summary>Reaproveita o filho: terminado, devolve o resultado dele; ainda andando, o pai espera por ele.</summary>
+    private async Task<string> AdoptChildAsync(RunContext ctx, Dictionary<string, object?> child, string callId)
+    {
+        var agentId = child.S("agent_id");
+        if (!RunStatus.IsTerminal(child.S("status")))
+            throw new ChildSuspendedException(child.G("id"), agentId, callId);
+        await _events.AddAsync(ctx, "delegation_end", new JsonObject
+        {
+            ["to_agent"] = agentId,
+            ["child_run_id"] = child.G("id").ToString(),
+            ["status"] = child.S("status"),
+            ["tokens"] = child.L("tokens"),
+            ["adopted"] = true
+        });
+        return DelegationResult.Format(agentId, child.S("status"), child.I("steps"), child.S("output"));
     }
 
     private async Task<string> CreateTask(JsonObject args, RunContext ctx)

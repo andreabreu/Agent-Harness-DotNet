@@ -55,6 +55,9 @@ public sealed class RunContext
     public required Budget Budget { get; init; }
     public Guid? ConversationId { get; init; }
 
+    /// <summary>Instancia dona do run enquanto ele executa (renova o lease); so ela grava o resultado.</summary>
+    public string Owner { get; init; } = "";
+
     /// <summary>Quem acompanha o run ao vivo (chat, API). Herdado pelos subagentes.</summary>
     public IRunObserver? Observer { get; init; }
 
@@ -86,11 +89,20 @@ public sealed class EventLog
     }
 
     /// <summary>Evento para um run que nao esta executando agora (suspenso, cancelado ou recebendo o resultado de um filho).</summary>
-    public Task AddDetachedAsync(Guid runId, string type, JsonObject data) =>
-        _db.ExecAsync(
+    public Task AddDetachedAsync(Guid runId, string type, JsonObject data) => AddDetachedAsync(_db, runId, type, data);
+
+    /// <summary>Mesmo que <see cref="AddDetachedAsync(Guid, string, JsonObject)"/>, dentro de uma transacao.</summary>
+    public static Task AddDetachedAsync(IDbExecutor db, Guid runId, string type, JsonObject data) =>
+        db.ExecAsync(
             @"insert into run_events (run_id, seq, type, data)
               select @r, coalesce(max(seq), 0) + 1, @t, @d from run_events where run_id = @r",
             ("r", runId), ("t", type), ("d", data));
+
+    /// <summary>A tool call chegou a comecar a executar neste run (pode ter tido efeito antes de uma queda).</summary>
+    public async Task<bool> ToolCallStartedAsync(Guid runId, string toolCallId) =>
+        await _db.ScalarAsync(
+            "select exists (select 1 from run_events where run_id = @r and type = 'tool_call_started' and data->>'tool_call_id' = @c)",
+            ("r", runId), ("c", toolCallId)) is true;
 }
 
 /// <summary>Recebe ao vivo os eventos de um run e dos seus subagentes (os mesmos gravados em run_events) e o texto em streaming.</summary>

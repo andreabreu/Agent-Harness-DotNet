@@ -140,6 +140,10 @@ public sealed class ConsoleChatRenderer
                 return ($"{who}pausado esperando o subagente {S(data, "child_agent")}", ConsoleColor.Yellow);
             case "run_resumed":
                 return ($"{who}retomado por {S(data, "by")}", ConsoleColor.Magenta);
+            case "run_recovered":
+                return ($"{who}recuperado de {S(data, "previous_owner")} (instancia caiu) por {S(data, "recovered_by")}", ConsoleColor.Magenta);
+            case "tool_call_recovered":
+                return ($"{who}{S(data, "name")} interrompida pela queda: {S(data, "decision")}", ConsoleColor.Yellow);
             case "budget_exceeded":
                 return ($"{who}budget de tokens esgotado (usados {S(data, "used")} de {S(data, "limit")})", ConsoleColor.Red);
             case "error":

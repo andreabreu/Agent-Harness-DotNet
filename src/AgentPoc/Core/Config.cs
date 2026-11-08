@@ -18,7 +18,9 @@ public sealed record AgentCfg(
     string Id, string Description, string ModelId, string SystemPrompt, string[] InitialTools, string[] AllowedTools,
     string[] CanDelegateTo, int MaxSteps, int MaxTokens, float? Temperature, int Version);
 
-public sealed record ToolDef(string Name, string Description, string Kind, string ParametersJson, string Policy, string ConfigJson);
+/// <param name="SideEffect">Pode ter efeito fora do agente; se interrompida por uma queda, nao e repetida sem uma pessoa decidir.</param>
+public sealed record ToolDef(string Name, string Description, string Kind, string ParametersJson, string Policy, string ConfigJson,
+                             bool SideEffect = true);
 
 /// <summary>Le agentes, modelos e provedores do banco. Nada de configuracao em codigo.</summary>
 public sealed class ConfigRepo

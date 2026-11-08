@@ -49,20 +49,23 @@ public sealed class ConversationStore : IConversationHistory
         .Select(r => new StoredMessage(r.I("seq"), RunMessageStore.MapMessage(r), r.GN("run_id"), r.T("created_at")))
         .ToList();
 
-    public async Task<int> AppendAsync(Guid conversationId, Guid runId, ChatMessage m)
+    public Task<int> AppendAsync(Guid conversationId, Guid runId, ChatMessage m) => AppendAsync(_db, conversationId, runId, m);
+
+    private static async Task<int> AppendAsync(IDbExecutor db, Guid conversationId, Guid runId, ChatMessage m)
     {
-        var seq = await _db.ScalarAsync(
+        var seq = await db.ScalarAsync(
             @"insert into conversation_messages (conversation_id, seq, role, content, tool_calls, tool_call_id, tool_name, run_id)
               select @c, coalesce(max(seq), 0) + 1, @role, @content, @calls, @callId, @tool, @run
                 from conversation_messages where conversation_id = @c
               returning seq",
             ("c", conversationId), ("role", m.Role), ("content", m.Content), ("calls", RunMessageStore.ToolCallsJson(m.ToolCalls)),
             ("callId", m.ToolCallId), ("tool", m.ToolName), ("run", runId));
-        await _db.ExecAsync("update conversations set updated_at = now() where id = @c", ("c", conversationId));
+        await db.ExecAsync("update conversations set updated_at = now() where id = @c", ("c", conversationId));
         return Convert.ToInt32(seq);
     }
 
-    Task IConversationHistory.AppendAsync(Guid conversationId, Guid runId, ChatMessage message) => AppendAsync(conversationId, runId, message);
+    Task IConversationHistory.AppendAsync(IDbExecutor db, Guid conversationId, Guid runId, ChatMessage message) =>
+        AppendAsync(db, conversationId, runId, message);
 
     public Task UpdateActiveToolsAsync(Guid conversationId, IEnumerable<string> activeTools) =>
         _db.ExecAsync("update conversations set active_tools = @t, updated_at = now() where id = @c",

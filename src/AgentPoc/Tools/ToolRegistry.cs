@@ -5,12 +5,12 @@ namespace AgentPoc.Tools;
 /// <summary>Registro de ferramentas no banco + descoberta por busca textual.</summary>
 public sealed class ToolRegistry
 {
-    private const string Cols = "name, description, kind, parameters::text as parameters, policy, config::text as config";
+    private const string Cols = "name, description, kind, parameters::text as parameters, policy, config::text as config, side_effect";
     private readonly Db _db;
     public ToolRegistry(Db db) => _db = db;
 
     private static ToolDef Map(Dictionary<string, object?> r) =>
-        new(r.S("name"), r.S("description"), r.S("kind"), r.S("parameters"), r.S("policy"), r.S("config"));
+        new(r.S("name"), r.S("description"), r.S("kind"), r.S("parameters"), r.S("policy"), r.S("config"), r.B("side_effect"));
 
     public async Task<Dictionary<string, ToolDef>> LoadAsync(IEnumerable<string> names)
     {

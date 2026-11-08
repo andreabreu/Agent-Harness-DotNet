@@ -21,9 +21,11 @@ public sealed class AgentRunner
     private readonly EventLog _events;
     private readonly RunMessageStore _messages;
     private readonly IRunLifecycle _lifecycle;
+    private readonly RunChain _chain;
+    private readonly RunLeaseOptions _lease;
 
     public AgentRunner(Db db, ConfigRepo config, ToolRegistry registry, ToolExecutor executor, EventLog events,
-                       RunMessageStore messages, IRunLifecycle lifecycle)
+                       RunMessageStore messages, RunChain chain, RunLeaseOptions lease, string instanceId)
     {
         _db = db;
         _config = config;
@@ -31,8 +33,14 @@ public sealed class AgentRunner
         _executor = executor;
         _events = events;
         _messages = messages;
-        _lifecycle = lifecycle;
+        _lifecycle = chain;
+        _chain = chain;
+        _lease = lease;
+        InstanceId = instanceId;
     }
+
+    /// <summary>Esta instancia: dona dos runs que ela executa (lease renovado por heartbeat).</summary>
+    public string InstanceId { get; }
 
     private static JsonArray ToArray(IEnumerable<string> items)
     {
@@ -44,9 +52,10 @@ public sealed class AgentRunner
     /// <param name="chat">Continuacao de conversa: historico, ferramentas ja descobertas e persistencia de cada mensagem nova.</param>
     /// <param name="hooks">Observer ao vivo e quem responde pelo humano; quando nulos, herda do pai ou usa o padrao da CLI.</param>
     /// <param name="runId">Id do run definido por quem chama (para registrar a execucao antes de comecar).</param>
+    /// <param name="parentToolCallId">Chamada delegate_task do pai que cria este run (torna a delegacao idempotente).</param>
     public async Task<RunResult> RunAsync(string agentId, string input, RunContext? parent = null, Guid? workflowRunId = null,
                                           long? budgetOverride = null, ChatTurn? chat = null, RunHooks? hooks = null,
-                                          Guid? runId = null, CancellationToken ct = default)
+                                          Guid? runId = null, string? parentToolCallId = null, CancellationToken ct = default)
     {
         var agent = await _config.GetAgentAsync(agentId)
                     ?? throw new InvalidOperationException($"Agente '{agentId}' nao existe ou esta desabilitado.");
@@ -60,10 +69,12 @@ public sealed class AgentRunner
         var conversationId = chat?.ConversationId ?? parent?.ConversationId;
 
         await _db.ExecAsync(
-            @"insert into runs (id, parent_run_id, root_run_id, workflow_run_id, conversation_id, agent_id, agent_version, model_id, input, depth, budget_limit)
-              values (@id, @p, @root, @wf, @conv, @a, @v, @m, @i, @d, @b)",
+            @"insert into runs (id, parent_run_id, root_run_id, workflow_run_id, conversation_id, agent_id, agent_version, model_id, input, depth,
+                                budget_limit, parent_tool_call_id, owner, lease_until)
+              values (@id, @p, @root, @wf, @conv, @a, @v, @m, @i, @d, @b, @call, @owner, now() + make_interval(secs => @lease))",
             ("id", id), ("p", parent?.RunId), ("root", rootId), ("wf", wfRun), ("conv", conversationId), ("a", agent.Id),
-            ("v", agent.Version), ("m", model.Id), ("i", input), ("d", depth), ("b", budget.Limit));
+            ("v", agent.Version), ("m", model.Id), ("i", input), ("d", depth), ("b", budget.Limit), ("call", parentToolCallId),
+            ("owner", InstanceId), ("lease", _lease.Lease.TotalSeconds));
 
         var ctx = new RunContext
         {
@@ -72,6 +83,7 @@ public sealed class AgentRunner
             RootRunId = rootId,
             WorkflowRunId = wfRun,
             ConversationId = conversationId,
+            Owner = InstanceId,
             Agent = agent,
             Model = model,
             Depth = depth,
@@ -80,6 +92,7 @@ public sealed class AgentRunner
             Human = hooks?.Human ?? parent?.Human ?? ModeHumanGate.Instance
         };
         foreach (var t in (await _registry.LoadAsync(ToolsToLoad(agent, chat))).Values) ctx.ActiveTools[t.Name] = t;
+        await SaveActiveToolsAsync(ctx);
 
         await _events.AddAsync(ctx, "run_started", new JsonObject
         {
@@ -98,13 +111,17 @@ public sealed class AgentRunner
         Log.Write(depth, ConsoleColor.Magenta, "agente", $"{agent.Id} v{agent.Version} iniciou run {Text.Short(id)} | modelo {model.Id} ({model.ResolvedName}) | budget {budget.Remaining:N0} tokens");
         Log.Write(depth, ConsoleColor.Gray, "entrada", input);
 
-        var loop = new LoopState(ctx, chat, chat?.History ?? Array.Empty<ChatMessage>(), _messages);
+        var loop = new LoopState(ctx, chat, chat?.History ?? Array.Empty<ChatMessage>(), _messages)
+        {
+            StillOwner = () => _chain.IsOwnerAsync(id, InstanceId)
+        };
         await loop.AppendAsync(ChatMessage.User(input));
         return await RunLoopAsync(loop, Array.Empty<ToolCall>(), ct);
     }
 
     /// <summary>
-    /// Retoma um run que o despachante ja marcou como running (mesmo run, mesmos contadores e budget).
+    /// Retoma um run que o despachante ja reivindicou (running, com lease desta instancia): mesmo run, mesmos
+    /// contadores e budget.
     /// O historico vem da conversa (agente raiz do chat) ou de run_messages (subagentes e demais runs). Primeiro
     /// conclui as tool calls que ficaram sem resultado (a decisao humana ja esta gravada) e segue o loop normal.
     /// </summary>
@@ -112,8 +129,8 @@ public sealed class AgentRunner
     {
         var run = await _db.QueryOneAsync("select * from runs where id = @id", ("id", runId))
                   ?? throw new InvalidOperationException($"Run {runId} nao encontrado.");
-        if (run.S("status") != RunStatus.Running)
-            throw new InvalidOperationException($"Run {Text.Short(runId)} precisa ser reivindicado antes de retomar (status {run.S("status")}).");
+        if (run.S("status") != RunStatus.Running || run.SN("owner") != InstanceId)
+            throw new InvalidOperationException($"Run {Text.Short(runId)} precisa ser reivindicado por esta instancia antes de retomar (status {run.S("status")}).");
         var agent = await _config.GetAgentAsync(run.S("agent_id"))
                     ?? throw new InvalidOperationException($"Agente '{run.S("agent_id")}' nao existe ou esta desabilitado.");
         var model = await _config.GetModelAsync(agent.ModelId);
@@ -129,6 +146,7 @@ public sealed class AgentRunner
             RootRunId = run.G("root_run_id"),
             WorkflowRunId = run.GN("workflow_run_id"),
             ConversationId = run.GN("conversation_id"),
+            Owner = InstanceId,
             Agent = agent,
             Model = model,
             Depth = depth,
@@ -147,6 +165,7 @@ public sealed class AgentRunner
         var history = chat?.History ?? await _messages.LoadAsync(runId);
         var loop = new LoopState(ctx, chat, history, _messages)
         {
+            StillOwner = () => _chain.IsOwnerAsync(runId, InstanceId),
             Steps = run.I("steps"),
             TokensIn = run.L("tokens_in"),
             TokensOut = run.L("tokens_out"),
@@ -186,13 +205,20 @@ public sealed class AgentRunner
         public long TokensOut { get; set; }
         public decimal Cost { get; set; }
 
+        /// <summary>Quem confere a posse antes de gravar (uma instancia que perdeu o lease nao escreve mais no historico).</summary>
+        public Func<Task<bool>>? StillOwner { get; init; }
+
         public async Task AppendAsync(ChatMessage message)
         {
+            if (StillOwner != null && !await StillOwner()) throw new LeaseLostException(Ctx.RunId);
             Messages.Add(message);
             if (_chat != null) await _chat.OnMessage(Ctx.RunId, message);
             else await _store.AppendAsync(Ctx.RunId, message);
         }
     }
+
+    /// <summary>Status devolvido (nao gravado) quando esta instancia perdeu a posse do run para outra.</summary>
+    public const string LeaseLostStatus = "lease_lost";
 
     private async Task<RunResult> RunLoopAsync(LoopState loop, IReadOnlyList<ToolCall> pendingCalls, CancellationToken ct)
     {
@@ -203,17 +229,26 @@ public sealed class AgentRunner
         var status = RunStatus.Running;
         var output = "";
         RunSuspendedException? suspension = null;
+        var leaseLost = false;
         var client = LlmFactory.For(model);
         var stream = StreamFor(ctx);
+        await using var lease = RunLeaseKeeper.Start(_db, ctx.RunId, InstanceId, _lease, ct);
+        var token = lease.Token;
 
         try
         {
             foreach (var call in pendingCalls)
-                await loop.AppendAsync(ChatMessage.Tool(call.Id, call.Name, await _executor.ExecuteAsync(ctx, call, ct)));
+                await loop.AppendAsync(ChatMessage.Tool(call.Id, call.Name, await _executor.ExecutePendingAsync(ctx, call, token)));
 
-            while (true)
+            if (pendingCalls.Count == 0 && FinalAnswer(loop.Messages) is { } answered)
             {
-                ct.ThrowIfCancellationRequested();
+                status = RunStatus.Completed;
+                output = answered;
+                Log.Write(depth, ConsoleColor.DarkGray, "retomada", $"{agent.Id} ja tinha a resposta final gravada; concluindo sem chamar o modelo");
+            }
+            else while (true)
+            {
+                token.ThrowIfCancellationRequested();
                 if (loop.Steps >= agent.MaxSteps)
                 {
                     status = "max_steps";
@@ -236,7 +271,7 @@ public sealed class AgentRunner
                     .Select(t => new ToolSpec(t.Name, t.Description, JsonNode.Parse(t.ParametersJson) ?? new JsonObject()))
                     .ToList();
 
-                var resp = await client.CompleteAsync(model, new LlmRequest(BuildSystem(agent, ctx, loop.Chat), loop.Messages, specs, agent.Temperature, stream), ct);
+                var resp = await client.CompleteAsync(model, new LlmRequest(BuildSystem(agent, ctx, loop.Chat), loop.Messages, specs, agent.Temperature, stream), token);
                 if (ctx.Observer != null && !model.SupportsStreaming && !string.IsNullOrEmpty(resp.Content))
                     ctx.Observer.OnTextDelta(ctx, resp.Content);
 
@@ -263,8 +298,8 @@ public sealed class AgentRunner
                     ["tool_calls"] = callsJson
                 });
                 await _db.ExecAsync(
-                    "update runs set steps = @s, tokens_in = @ti, tokens_out = @to, cost_usd = @c where id = @id",
-                    ("s", loop.Steps), ("ti", loop.TokensIn), ("to", loop.TokensOut), ("c", loop.Cost), ("id", ctx.RunId));
+                    "update runs set steps = @s, tokens_in = @ti, tokens_out = @to, cost_usd = @c where id = @id and owner = @owner",
+                    ("s", loop.Steps), ("ti", loop.TokensIn), ("to", loop.TokensOut), ("c", loop.Cost), ("id", ctx.RunId), ("owner", InstanceId));
 
                 var decision = resp.ToolCalls.Count == 0 ? "resposta final" : "chama " + string.Join(", ", resp.ToolCalls.Select(c => c.Name));
                 Log.Write(depth, ConsoleColor.Cyan, "modelo", $"{agent.Id} passo {loop.Steps}: {resp.InputTokens}->{resp.OutputTokens} tokens, {resp.LatencyMs}ms, {decision}");
@@ -277,13 +312,15 @@ public sealed class AgentRunner
 
                 if (resp.ToolCalls.Count == 0)
                 {
-                    status = "completed";
+                    status = RunStatus.Completed;
                     output = resp.Content ?? "";
                     break;
                 }
 
+                var toolsBefore = ctx.ActiveTools.Count;
                 foreach (var call in resp.ToolCalls)
-                    await loop.AppendAsync(ChatMessage.Tool(call.Id, call.Name, await _executor.ExecuteAsync(ctx, call, ct)));
+                    await loop.AppendAsync(ChatMessage.Tool(call.Id, call.Name, await _executor.ExecuteAsync(ctx, call, token)));
+                if (ctx.ActiveTools.Count != toolsBefore) await SaveActiveToolsAsync(ctx);
             }
         }
         catch (RunSuspendedException suspended)
@@ -291,43 +328,42 @@ public sealed class AgentRunner
             suspension = suspended;
             status = RunStatus.ForSuspension(suspended);
             output = suspended.Message;
-            var data = new JsonObject { ["tool_call_id"] = suspended.ToolCallId, ["step"] = loop.Steps };
-            if (suspended is HumanInputRequiredException human) data["request_id"] = human.RequestId.ToString();
-            if (suspended is ChildSuspendedException child)
-            {
-                data["child_run_id"] = child.ChildRunId.ToString();
-                data["child_agent"] = child.ChildAgent;
-            }
-            await _events.AddAsync(ctx, status, data);
-            Log.Write(depth, ConsoleColor.Yellow, "aguardando", $"{agent.Id} run {Text.Short(ctx.RunId)}: {suspended.Message}");
+        }
+        catch (LeaseLostException)
+        {
+            leaseLost = true;
+        }
+        catch (OperationCanceledException) when (lease.Lost)
+        {
+            leaseLost = true;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            status = "cancelled";
+            status = RunStatus.Cancelled;
             output = "Cancelado pelo usuario.";
             foreach (var orphan in UnansweredToolCalls(loop.Messages))
                 await loop.AppendAsync(ChatMessage.Tool(orphan.Id, orphan.Name, "CANCELADO: o usuario interrompeu antes desta ferramenta terminar."));
             await _events.AddAsync(ctx, "cancelled", new JsonObject { ["step"] = loop.Steps });
             Log.Write(depth, ConsoleColor.Yellow, "cancelado", $"{agent.Id} run {Text.Short(ctx.RunId)}");
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException and not InjectedFaultException)
         {
-            status = "failed";
+            status = RunStatus.Failed;
             output = $"Erro: {ex.Message}";
             await _events.AddAsync(ctx, "error", new JsonObject { ["type"] = ex.GetType().Name, ["message"] = ex.Message });
             Log.Write(depth, ConsoleColor.Red, "erro", $"{agent.Id}: {ex.Message}");
         }
 
-        var suspendedNow = suspension != null;
-        await _db.ExecAsync(
-            @"update runs set status = @st, output = @o, steps = @s, tokens_in = @ti, tokens_out = @to, cost_usd = @c,
-                     waiting_on_run_id = @wait, pending_tool_call_id = @call, active_tools = @tools,
-                     finished_at = case when @suspended then null else now() end
-               where id = @id",
-            ("st", status), ("o", output), ("s", loop.Steps), ("ti", loop.TokensIn), ("to", loop.TokensOut), ("c", loop.Cost),
-            ("wait", (suspension as ChildSuspendedException)?.ChildRunId), ("call", suspension?.ToolCallId),
-            ("tools", ctx.ActiveTools.Keys.OrderBy(k => k).ToArray()), ("suspended", suspendedNow), ("id", ctx.RunId));
-        if (!suspendedNow)
+        var outcome = new RunOutcome(status, output, loop.Steps, loop.TokensIn, loop.TokensOut, loop.Cost,
+            ctx.ActiveTools.Keys.ToArray(), suspension);
+        if (leaseLost || !await _lifecycle.RecordOutcomeAsync(ctx, outcome))
+        {
+            Log.Write(depth, ConsoleColor.Yellow, "lease", $"{agent.Id} run {Text.Short(ctx.RunId)}: posse perdida para outra instancia; nada gravado");
+            return new RunResult(ctx.RunId, ctx.RootRunId, LeaseLostStatus, "Outra instancia assumiu o run.", loop.TokensIn, loop.TokensOut, loop.Cost, loop.Steps);
+        }
+
+        if (suspension != null) await _events.AddAsync(ctx, status, SuspensionEvent(suspension, loop.Steps));
+        else
             await _events.AddAsync(ctx, "run_finished", new JsonObject
             {
                 ["status"] = status,
@@ -337,11 +373,8 @@ public sealed class AgentRunner
                 ["cost_usd"] = loop.Cost,
                 ["output"] = Text.Trunc(output, 4000)
             });
-        Log.Write(depth, status == "completed" ? ConsoleColor.Green : ConsoleColor.Red, "fim",
+        Log.Write(depth, status == RunStatus.Completed ? ConsoleColor.Green : ConsoleColor.Red, "fim",
             $"{agent.Id} run {Text.Short(ctx.RunId)}: {status} | {loop.Steps} passos | {loop.TokensIn + loop.TokensOut:N0} tokens | US$ {loop.Cost:0.0000}");
-
-        if (suspension != null) await _lifecycle.OnSuspendedAsync(ctx, suspension);
-        else await _lifecycle.OnFinishedAsync(ctx, status);
 
         return new RunResult(ctx.RunId, ctx.RootRunId, status, output, loop.TokensIn, loop.TokensOut, loop.Cost, loop.Steps)
         {
@@ -350,6 +383,33 @@ public sealed class AgentRunner
             WaitingOnRun = (suspension as ChildSuspendedException)?.ChildRunId
         };
     }
+
+    /// <summary>
+    /// Ferramentas carregadas agora (inclusive as descobertas no meio do run): se a instancia cair, quem recuperar
+    /// o run precisa delas para reexecutar as chamadas pendentes.
+    /// </summary>
+    private Task SaveActiveToolsAsync(RunContext ctx) =>
+        _db.ExecAsync("update runs set active_tools = @t where id = @id and owner = @owner",
+            ("t", ctx.ActiveTools.Keys.OrderBy(k => k).ToArray()), ("id", ctx.RunId), ("owner", ctx.Owner));
+
+    private static JsonObject SuspensionEvent(RunSuspendedException suspension, int step)
+    {
+        var data = new JsonObject { ["tool_call_id"] = suspension.ToolCallId, ["step"] = step };
+        if (suspension is HumanInputRequiredException human) data["request_id"] = human.RequestId.ToString();
+        if (suspension is ChildSuspendedException child)
+        {
+            data["child_run_id"] = child.ChildRunId.ToString();
+            data["child_agent"] = child.ChildAgent;
+        }
+        return data;
+    }
+
+    /// <summary>
+    /// O run ja tinha gravado a resposta final antes de parar (ex.: caiu entre gravar a resposta e concluir):
+    /// a ultima mensagem e do assistente, sem tool calls. Concluir com ela evita chamar o modelo de novo.
+    /// </summary>
+    public static string? FinalAnswer(IReadOnlyList<ChatMessage> messages) =>
+        messages.Count > 0 && messages[^1] is { Role: "assistant", ToolCalls: null or { Count: 0 } } last ? last.Content ?? "" : null;
 
     /// <summary>Ferramentas iniciais do agente mais as descobertas em turnos anteriores que ainda estao no escopo dele.</summary>
     private static IEnumerable<string> ToolsToLoad(AgentCfg agent, ChatTurn? chat) =>

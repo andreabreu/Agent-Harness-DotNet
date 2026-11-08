@@ -63,8 +63,15 @@ public sealed class ChatService
     {
         if (_turnLocks.TryGetValue(conversationId, out var gate) && gate.CurrentCount == 0) return true;
         if (await _store.LatestRootRunAsync(conversationId) is not { } root || RunStatus.IsTerminal(root.Status)) return false;
+        if (root.Status == RunStatus.Running) await RecoverIfOrphanAsync();
         return !await _chain.IsSettledAsync(root.RunId);
     }
+
+    /// <summary>
+    /// Turno "executando" cuja instancia caiu (lease vencido): volta para ready agora, sem esperar a varredura, e o
+    /// despachante o retoma. A conversa continua ocupada enquanto o turno anda, mas nunca fica presa.
+    /// </summary>
+    private Task RecoverIfOrphanAsync() => _chain.RecoverOrphansAsync(_runner.InstanceId);
 
     /// <summary>
     /// Roda um turno neste processo ate terminar ou suspender. Se o turno anterior estava suspenso esperando

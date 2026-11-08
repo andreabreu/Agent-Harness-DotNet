@@ -48,6 +48,8 @@ insert into tools (name, description, kind, parameters, policy, config, keywords
   '{"type":"object","properties":{"query":{"type":"string","description":"consulta de busca, de preferencia com termos especificos"},"limit":{"type":"integer","description":"quantidade de resultados (1-10, padrao 5)"}},"required":["query"]}', 'auto', '{}', 'web internet pesquisa buscar busca google noticias atual recente fonte'),
  ('ask_human', 'Faz uma pergunta a pessoa responsavel e espera a resposta (pode levar minutos ou dias; o trabalho fica pausado sem custo). Use no meio de uma tarefa quando faltar uma informacao que so a pessoa tem, ou antes de um passo irreversivel em que a escolha muda o resultado. Nao use para confirmar o obvio.', 'builtin',
   '{"type":"object","properties":{"question":{"type":"string","description":"pergunta curta e objetiva"},"options":{"type":"array","items":{"type":"string"},"description":"opcoes sugeridas (opcional)"}},"required":["question"]}', 'auto', '{}', 'perguntar humano pessoa usuario confirmar duvida decisao esclarecer'),
+ ('wait_seconds', 'Espera alguns segundos antes de continuar (para aguardar algo externo ficar pronto).', 'builtin',
+  '{"type":"object","properties":{"seconds":{"type":"integer","description":"segundos (1 a 60)"}},"required":["seconds"]}', 'auto', '{}', 'esperar aguardar segundos pausa'),
  ('think', 'Espaco para raciocinar antes de agir: analise o pedido, resultados inesperados de ferramentas ou decida o proximo passo. Nao executa nada e nao e visto como resposta ao usuario.', 'builtin',
   '{"type":"object","properties":{"thought":{"type":"string","description":"o raciocinio"}},"required":["thought"]}', 'auto', '{}', 'pensar raciocinar refletir analisar'),
  ('update_plan', 'Registra ou atualiza o plano da tarefa atual como uma lista de passos com status. Use em tarefas com mais de dois passos e atualize o status conforme avanca; o usuario acompanha o plano em tempo real.', 'builtin',
@@ -78,6 +80,13 @@ insert into tools (name, description, kind, parameters, policy, config, keywords
   'cep endereco brasil logradouro')
 on conflict (name) do update set description = excluded.description, kind = excluded.kind,
   parameters = excluded.parameters, policy = excluded.policy, config = excluded.config, keywords = excluded.keywords;
+
+-- ferramentas sem efeito colateral: podem ser repetidas sozinhas quando uma chamada foi interrompida por uma queda.
+-- delegate_task e ask_human entram aqui porque sao idempotentes pela tool call (reaproveitam o filho / o pedido ja criado).
+update tools set side_effect = false
+ where name in ('search_tools', 'list_agents', 'check_task', 'memory_recall', 'kb_search', 'http_get', 'web_search',
+                'read_file', 'list_files', 'think', 'update_plan', 'ask_human', 'delegate_task', 'wait_seconds',
+                'weather_forecast', 'cep_lookup');
 
 -- ---------------- MCP (desligado por padrao; precisa de Node no host) ----------------
 insert into mcp_servers (id, command, args, enabled) values

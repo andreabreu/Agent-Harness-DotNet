@@ -107,7 +107,7 @@ try
         case "dispatcher":
         {
             var n = int.TryParse(Opt("concurrency"), out var c) ? c : 2;
-            await app.Dispatcher.RunAsync(n, TimeSpan.FromSeconds(30), cts.Token);
+            await app.Dispatcher.RunAsync(n, app.Lease.Sweep, cts.Token);
             break;
         }
         case "workflow":

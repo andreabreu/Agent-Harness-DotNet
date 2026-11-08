@@ -15,7 +15,6 @@ public sealed class ChatCli
     private const int DispatcherConcurrency = 2;
     private const int ConversationsListed = 15;
     private const int HistoryMessagesShown = 20;
-    private static readonly TimeSpan DispatcherSweep = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan FeedPollInterval = TimeSpan.FromMilliseconds(200);
 
     private readonly App _app;
@@ -42,7 +41,7 @@ public sealed class ChatCli
     {
         using var backgroundCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var workers = startWorkers ? Task.Run(() => _app.Worker.RunAsync(BackgroundWorkers, untilEmpty: false, backgroundCts.Token)) : Task.CompletedTask;
-        var dispatcher = Task.Run(() => _app.Dispatcher.RunAsync(DispatcherConcurrency, DispatcherSweep, backgroundCts.Token));
+        var dispatcher = Task.Run(() => _app.Dispatcher.RunAsync(DispatcherConcurrency, _app.Lease.Sweep, backgroundCts.Token));
 
         if (conversation != null) await OpenAsync(conversation);
         else await NewAsync(_agentId);

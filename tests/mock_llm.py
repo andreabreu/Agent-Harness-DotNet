@@ -302,6 +302,23 @@ def assistant(c):
             return [call("run_shell", command="rm -rf ./*")]
         return "Nao foi possivel apagar: " + c.turn_result("run_shell")[:200]
 
+    if "espere" in t:
+        step = need_tool(c, "wait_seconds", "esperar aguardar segundos")
+        if step:
+            return step
+        if not c.turn_called("wait_seconds"):
+            seconds = re.search(r"(\d+) segundos", t)
+            return [call("wait_seconds", seconds=int(seconds.group(1)) if seconds else 5)]
+        return "Esperei e terminei: " + c.turn_result("wait_seconds")
+
+    if "comando lento" in t:
+        step = need_tool(c, "run_shell", "executar comando shell")
+        if step:
+            return step
+        if not c.turn_called("run_shell"):
+            return [call("run_shell", command="sleep 6 && echo executado >> efeito_lento.txt")]
+        return "Resultado do comando: " + c.turn_result("run_shell")[:200]
+
     if "segundo plano" in t:
         if not c.turn_called("create_task"):
             return [call("create_task", agent="researcher", task="Consulte o endereco do CEP 01310100 e informe logradouro e bairro.")]

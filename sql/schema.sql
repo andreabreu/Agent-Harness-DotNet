@@ -66,6 +66,9 @@ create table if not exists tools (
     search      tsvector generated always as (to_tsvector('simple', name || ' ' || description || ' ' || keywords)) stored
 );
 create index if not exists ix_tools_search on tools using gin (search);
+-- true = pode ter efeito fora do agente (escreve, executa, envia). Padrao seguro: so as marcadas como false
+-- sao repetidas sozinhas quando uma chamada foi interrompida por uma queda.
+alter table tools add column if not exists side_effect boolean not null default true;
 
 -- ---------------- execucao ----------------
 
@@ -98,6 +101,11 @@ alter table runs add column if not exists waiting_on_run_id uuid;      -- waitin
 alter table runs add column if not exists pending_tool_call_id text;   -- tool call que recebe o resultado na retomada
 alter table runs add column if not exists budget_limit bigint;         -- limite efetivo do run (o filho herda uma fatia do pai)
 alter table runs add column if not exists active_tools text[];         -- ferramentas carregadas ao suspender (descobertas incluidas)
+alter table runs add column if not exists owner text;                  -- instancia que esta executando o run
+alter table runs add column if not exists lease_until timestamptz;      -- posse renovada por heartbeat; vencida = orfao
+alter table runs add column if not exists parent_tool_call_id text;     -- chamada delegate_task do pai que criou este run
+create index if not exists ix_runs_lease on runs(lease_until) where status = 'running';
+create index if not exists ix_runs_parent_call on runs(parent_run_id, parent_tool_call_id) where parent_tool_call_id is not null;
 create index if not exists ix_runs_ready on runs(started_at) where status = 'ready';
 create index if not exists ix_runs_waiting_on on runs(waiting_on_run_id) where waiting_on_run_id is not null;
 create index if not exists ix_runs_root on runs(root_run_id);

@@ -61,10 +61,11 @@ internal sealed class Wakeup
 }
 
 /// <summary>
-/// Retoma runs prontos (status ready) de qualquer origem: decisao humana, prazo vencido ou filho que terminou.
-/// Pega cada run com FOR UPDATE SKIP LOCKED e o marca running no mesmo comando, entao varias instancias podem
-/// rodar o despachante sem retomar o mesmo run duas vezes. Acorda por LISTEN/NOTIFY e varre periodicamente,
-/// expirando pedidos vencidos. Serve para chat hoje e para tarefas da fila e nos de workflow depois.
+/// Retoma runs prontos (status ready) de qualquer origem: decisao humana, prazo vencido, filho que terminou ou
+/// run orfao (lease vencido porque a instancia dona caiu). Pega cada run com FOR UPDATE SKIP LOCKED e o marca
+/// running com o lease desta instancia no mesmo comando, entao varias instancias podem rodar o despachante sem
+/// retomar o mesmo run duas vezes. Acorda por LISTEN/NOTIFY e varre periodicamente: expira pedidos vencidos,
+/// recupera orfaos e reconcilia pais parados em filhos ja terminados.
 /// </summary>
 public sealed class ResumeDispatcher
 {
@@ -75,10 +76,11 @@ public sealed class ResumeDispatcher
     private readonly RunExecutions _executions;
     private readonly IHumanGate _human;
     private readonly Func<Guid?, IRunObserver?> _observerFor;
+    private readonly RunLeaseOptions _lease;
     private readonly Wakeup _wakeup = new();
 
     public ResumeDispatcher(Db db, AgentRunner runner, RunChain chain, IConversationHistory conversations, RunExecutions executions,
-                            IHumanGate human, Func<Guid?, IRunObserver?> observerFor)
+                            IHumanGate human, Func<Guid?, IRunObserver?> observerFor, RunLeaseOptions lease)
     {
         _db = db;
         _runner = runner;
@@ -87,7 +89,8 @@ public sealed class ResumeDispatcher
         _executions = executions;
         _human = human;
         _observerFor = observerFor;
-        Name = $"{Environment.MachineName}-{Environment.ProcessId}-{Guid.NewGuid().ToString("N")[..4]}";
+        _lease = lease;
+        Name = runner.InstanceId;
     }
 
     public string Name { get; }
@@ -101,13 +104,26 @@ public sealed class ResumeDispatcher
         {
             while (!ct.IsCancellationRequested)
             {
-                if (await _chain.ExpireDueAsync() > 0) _wakeup.Pulse();
+                await SweepAsync();
                 await Task.Delay(sweepInterval, ct);
             }
         }
         catch (OperationCanceledException) { /* encerrando */ }
         _wakeup.Pulse();
         try { await Task.WhenAll(workers); } catch (OperationCanceledException) { /* encerrando */ }
+    }
+
+    private async Task SweepAsync()
+    {
+        try
+        {
+            var changed = await _chain.ExpireDueAsync() + await _chain.RecoverOrphansAsync(Name) + await _chain.ReconcileAsync();
+            if (changed > 0) _wakeup.Pulse();
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"despachante {Name}: varredura falhou: {ex.Message}");
+        }
     }
 
     private void OnNotification(string channel, string payload)
@@ -134,6 +150,10 @@ public sealed class ResumeDispatcher
             {
                 return;
             }
+            catch (InjectedFaultException ex)
+            {
+                Log.Warn($"despachante {Name}: {ex.Message} O run fica como estava; o lease vence e outra varredura o recupera.");
+            }
             catch (Exception ex)
             {
                 Log.Error($"despachante {Name}: {ex.Message}");
@@ -143,9 +163,10 @@ public sealed class ResumeDispatcher
 
     private Task<Dictionary<string, object?>?> ClaimAsync() =>
         _db.QueryOneAsync(
-            @"update runs set status = 'running'
+            @"update runs set status = 'running', owner = @owner, lease_until = now() + make_interval(secs => @lease)
                where id = (select id from runs where status = 'ready' order by started_at limit 1 for update skip locked)
-           returning id, root_run_id, depth, conversation_id, active_tools");
+           returning id, root_run_id, depth, conversation_id, active_tools",
+            ("owner", Name), ("lease", _lease.Lease.TotalSeconds));
 
     private async Task ResumeAsync(Dictionary<string, object?> run, CancellationToken ct)
     {
@@ -161,12 +182,10 @@ public sealed class ResumeDispatcher
             var result = await _runner.ResumeAsync(runId, chat, new RunHooks(_observerFor(conversationId), _human), Name, execution.Token);
             if (chat != null) await _conversations.UpdateActiveToolsAsync(chat.ConversationId, result.ActiveTools);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        catch (Exception ex) when (ex is not InjectedFaultException && (ex is not OperationCanceledException || !ct.IsCancellationRequested))
         {
             Log.Error($"despachante {Name}: falha ao retomar run {Text.Short(runId)}: {ex.Message}");
-            await _db.ExecAsync("update runs set status = 'failed', output = @o, finished_at = now() where id = @id and status = 'running'",
-                ("o", $"Erro ao retomar: {ex.Message}"), ("id", runId));
-            await _chain.TryDeliverToParentAsync(runId);
+            await _chain.FailRunAsync(runId, $"Erro ao retomar: {ex.Message}");
         }
     }
 }

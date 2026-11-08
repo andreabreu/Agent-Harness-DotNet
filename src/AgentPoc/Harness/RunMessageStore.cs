@@ -13,8 +13,11 @@ public sealed class RunMessageStore
     private readonly Db _db;
     public RunMessageStore(Db db) => _db = db;
 
-    public Task AppendAsync(Guid runId, ChatMessage m) =>
-        _db.ExecAsync(
+    public Task AppendAsync(Guid runId, ChatMessage m) => AppendAsync(_db, runId, m);
+
+    /// <summary>Grava a mensagem no historico do run usando <paramref name="db"/> (pode ser uma transacao).</summary>
+    public static Task AppendAsync(IDbExecutor db, Guid runId, ChatMessage m) =>
+        db.ExecAsync(
             @"insert into run_messages (run_id, seq, role, content, tool_calls, tool_call_id, tool_name)
               select @r, coalesce(max(seq), 0) + 1, @role, @content, @calls, @callId, @tool
                 from run_messages where run_id = @r",

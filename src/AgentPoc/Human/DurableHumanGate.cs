@@ -24,7 +24,7 @@ public sealed class DurableHumanGate : IHumanGate
 
     public async Task<ApprovalDecision> ApproveAsync(RunContext ctx, string toolCallId, string tool, JsonObject args, string policyReason, CancellationToken ct)
     {
-        var request = await _store.FindAsync(ctx.RunId, toolCallId);
+        var request = SameCall(await _store.FindAsync(ctx.RunId, toolCallId), tool, args);
         if (request == null)
         {
             var id = await _store.CreateApprovalAsync(ctx.RunId, ctx.ConversationId, toolCallId, tool, args, policyReason, _expiresIn);
@@ -41,7 +41,9 @@ public sealed class DurableHumanGate : IHumanGate
 
     public async Task<string> AskAsync(RunContext ctx, string toolCallId, string question, IReadOnlyList<string> options, CancellationToken ct)
     {
-        var request = await _store.FindAsync(ctx.RunId, toolCallId);
+        var request = await _store.FindAsync(ctx.RunId, toolCallId) is { } found && found.Kind == "question" && found.Question == question
+            ? found
+            : null;
         if (request == null)
         {
             var id = await _store.CreateQuestionAsync(ctx.RunId, ctx.ConversationId, toolCallId, question, options, _expiresIn);
@@ -59,6 +61,13 @@ public sealed class DurableHumanGate : IHumanGate
             _ => $"SEM RESPOSTA: a pergunta {request.Status} ({request.Reason}). Replaneje: siga com a opcao mais segura e deixe a suposicao explicita."
         };
     }
+
+    /// <summary>
+    /// A decisao so vale para a mesma ferramenta com os mesmos argumentos. Ids de tool call podem se repetir
+    /// (modelos locais geram "call_0"); sem esta checagem uma chamada nova herdaria uma aprovacao antiga.
+    /// </summary>
+    private static HumanRequest? SameCall(HumanRequest? request, string tool, JsonObject args) =>
+        request != null && request.Kind == "approval" && request.Tool == tool && JsonNode.DeepEquals(request.Args, args) ? request : null;
 
     private Task AnnounceAsync(RunContext ctx, Guid id, string kind, JsonObject data)
     {

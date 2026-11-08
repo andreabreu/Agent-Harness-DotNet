@@ -22,6 +22,38 @@ public sealed class ToolExecutor
         _events = events;
     }
 
+    /// <summary>
+    /// Chamada pendente encontrada na retomada. Se ela nunca comecou, executa normalmente. Se comecou e nao gravou
+    /// resultado (queda no meio), segue <see cref="ToolRecovery"/>: sem efeito colateral repete; com efeito pergunta
+    /// a uma pessoa (pedido duravel) se repete, pula ou usa um resultado informado.
+    /// </summary>
+    public async Task<string> ExecutePendingAsync(RunContext ctx, ToolCall call, CancellationToken ct)
+    {
+        if (!ctx.ActiveTools.TryGetValue(call.Name, out var def) ||
+            ToolRecovery.ForInterrupted(def.SideEffect) == RecoveryAction.Repeat ||
+            !await _events.ToolCallStartedAsync(ctx.RunId, call.Id))
+            return await ExecuteAsync(ctx, call, ct);
+
+        var decision = ToolRecovery.FromAnswer(await ctx.Human.AskAsync(ctx, ToolRecovery.QuestionId(call.Id),
+            ToolRecovery.Question(call.Name, Text.Trunc(call.ArgumentsJson, 300)), ToolRecovery.Options, ct));
+        await _events.AddAsync(ctx, "tool_call_recovered", new JsonObject
+        {
+            ["name"] = call.Name,
+            ["tool_call_id"] = call.Id,
+            ["side_effect"] = def.SideEffect,
+            ["decision"] = decision.Action.ToString()
+        });
+        Log.Write(ctx.Depth, ConsoleColor.Yellow, "retomada", $"{call.Name} interrompida por queda: {decision.Action}");
+
+        var sw = Stopwatch.StartNew();
+        return decision.Action switch
+        {
+            RecoveryAction.Repeat => await ExecuteAsync(ctx, call, ct),
+            RecoveryAction.UseInformedResult => await Finish(ctx, call.Name, true, sw, ToolRecovery.InformedResult(call.Name, decision.InformedResult!)),
+            _ => await Finish(ctx, call.Name, true, sw, ToolRecovery.SkippedResult(call.Name))
+        };
+    }
+
     public async Task<string> ExecuteAsync(RunContext ctx, ToolCall call, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
@@ -74,6 +106,7 @@ public sealed class ToolExecutor
             }
         }
 
+        await _events.AddAsync(ctx, "tool_call_started", new JsonObject { ["name"] = def.Name, ["tool_call_id"] = call.Id });
         string output;
         try
         {
@@ -89,7 +122,7 @@ public sealed class ToolExecutor
         {
             throw;
         }
-        catch (RunSuspendedException)
+        catch (Exception ex) when (ex is RunSuspendedException or InjectedFaultException or LeaseLostException)
         {
             throw;
         }
