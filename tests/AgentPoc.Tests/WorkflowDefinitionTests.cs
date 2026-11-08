@@ -163,4 +163,53 @@ public class WorkflowDefinitionNodeTypesTests
         Assert.Contains("e.status: use completed ou failed", errors);
         Assert.Contains("e.next: um no end nao tem destinos", errors);
     }
+
+    [Fact]
+    public void Resilience_fields_are_parsed()
+    {
+        var definition = Parse("""
+            {"max_parallel": 2, "timeout_seconds": 600,
+             "nodes": {
+               "a": {"type": "tool", "tool": "http_get", "args": {"url": "x"}, "timeout_seconds": 30, "optional": true,
+                     "retry": {"max_attempts": 3, "backoff_seconds": 0.5, "factor": 3, "on": ["error"]},
+                     "compensate": {"type": "tool", "tool": "run_shell", "args": {"command": "desfazer {{a}}"}}}
+             }}
+            """);
+        var a = definition.Nodes["a"];
+
+        Assert.Equal(2, definition.MaxParallel);
+        Assert.Equal(600, definition.TimeoutSeconds);
+        Assert.Equal(30, a.TimeoutSeconds);
+        Assert.True(a.Optional);
+        Assert.Equal(3, a.Retry.MaxAttempts);
+        Assert.Equal(new[] { NodeFailure.Error }, a.Retry.On);
+        Assert.Equal(WorkflowNodeType.Tool, a.Compensate?.Type);
+    }
+
+    [Fact]
+    public void Resilience_fields_are_validated()
+    {
+        var errors = Errors("""
+            {"max_parallel": 0, "timeout_seconds": -1,
+             "nodes": {
+               "a": {"type": "tool", "tool": "kb_search", "timeout_seconds": 0, "optional": "sim",
+                     "retry": {"max_attempts": 11, "backoff_seconds": -1, "factor": 0.5, "on": ["erro"]},
+                     "compensate": {"type": "condition", "next": ["a"]}},
+               "b": {"type": "transform", "output": "x", "retry": {"max_attempts": 2}}
+             }}
+            """);
+
+        Assert.Contains("max_parallel: use um inteiro de 1 a 50", errors);
+        Assert.Contains("timeout_seconds: use um inteiro maior que zero", errors);
+        Assert.Contains("a.timeout_seconds: use um inteiro maior que zero", errors);
+        Assert.Contains("a.optional: use true ou false", errors);
+        Assert.Contains("a.retry.max_attempts: use um inteiro de 1 a 10", errors);
+        Assert.Contains("a.retry.backoff_seconds: use um numero maior ou igual a zero", errors);
+        Assert.Contains("a.retry.factor: use um numero maior ou igual a 1", errors);
+        Assert.Contains("a.retry.on: use error e/ou timeout", errors);
+        Assert.Contains("a.compensate.type: use tool ou agent", errors);
+        Assert.Contains("a.compensate.next: a compensacao nao tem destinos", errors);
+        Assert.Contains("b.retry: so em nos agent e tool", errors);
+    }
 }
+

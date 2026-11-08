@@ -40,7 +40,8 @@ public sealed class WorkflowScheduler
 
     public void Fail(string node) => _states[node] = NodeState.Failed;
 
-    public SchedulerStep Next()
+    /// <param name="limit">Maximo de nos running ao mesmo tempo (max_parallel); os demais prontos ficam para depois.</param>
+    public SchedulerStep Next(int? limit = null)
     {
         var skipped = new List<string>();
         for (var changed = true; changed;)
@@ -50,7 +51,8 @@ public sealed class WorkflowScheduler
             skipped.AddRange(newlySkipped);
             changed = newlySkipped.Count > 0;
         }
-        var ready = Pending().Where(n => Decide(n) == NodeState.Running).ToList();
+        var slots = limit is { } max ? Math.Max(0, max - _states.Values.Count(st => st == NodeState.Running)) : int.MaxValue;
+        var ready = Pending().Where(n => Decide(n) == NodeState.Running).Take(slots).ToList();
         foreach (var node in ready) _states[node] = NodeState.Running;
         return new SchedulerStep(ready, skipped);
     }

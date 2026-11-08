@@ -141,7 +141,8 @@ API usada pela tela (sem autenticacao; escuta so em localhost):
 | `agents` / `tools` | mostra a configuracao lida do banco |
 | `task <agente> "<texto>"` | roda um agente; pede aprovacao no terminal para ferramentas `approval` |
 | `workflow <id> "<entrada>" [--crash-after <no>] [--approval deny\|auto\|ask]` | roda um workflow (opcionalmente simulando queda); sem modo informado, nega ferramentas de aprovacao |
-| `workflow --resume <workflow_run_id> [--approval ...]` | retoma um workflow a partir dos checkpoints, com o modo de aprovacao gravado na execucao |
+| `workflow --resume <workflow_run_id> [--approval ...]` | retoma um workflow a partir dos checkpoints, com o modo de aprovacao gravado na execucao (recusado enquanto outra instancia tem lease valido) |
+| `workflow --cancel <workflow_run_id>` | cancela um workflow: parado, na hora; em execucao, a instancia dona para no proximo heartbeat (codigo 1 se ja terminou) |
 | `worker [--concurrency N] [--once]` | processa a fila de tarefas assincronas |
 | `sync-mcp` | importa as tools dos servidores MCP habilitados |
 | `demo [cenario\|all]` | roda os cenarios de demonstracao com checagens automaticas |
@@ -166,7 +167,7 @@ Opcoes: `--approval auto|deny|ask`, `--budget <tokens>`.
 | `durabilidade_entrega` | Queda injetada (`AGENTPOC_FAULT`) dentro da transacao que conclui o filho e acorda o pai: nada fica pela metade, o lease vence, o filho e recuperado sem chamar o modelo de novo e o pai termina com um unico `tool_result`; pai preso forjado no banco e corrigido pela reconciliacao |
 | `workflow_aprovacao` | Workflow sem modo informado nega `run_shell` (no de ferramenta e subagente), modo `auto` explicito executa, `tools.allow` libera, `tools.block` bloqueia ferramenta `auto`, `deny_when` vence o `allow`, tarefa da fila criada no workflow herda o padrao no worker, regra com ferramenta inexistente impede o inicio; cada decisao grava a origem |
 | `workflow_desvio` | Triagem: classificador com `output_schema` (nova tentativa quando erra o formato), desvio com 3 casos e `default`, ramos pulados, join `all_active`, join `any`, `transform` com tipos preservados, `end` com falha, entrada fora do `input_schema` e definicao invalida rejeitadas, queda depois do desvio retomada sem reclassificar |
-| `workflow_resiliente` | Execucao com dono morto (lease vencido, forjada) recuperada pelo despachante sem repetir o no pronto; `--resume` recusado com dono vivo; versao fixa (definicao trocada no meio, a retomada termina na antiga, a nova execucao usa a nova); execucao sem copia usa a atual com `definition_not_pinned` |
+| `workflow_resiliente` | Execucao com dono morto (lease vencido, forjada) recuperada pelo despachante sem repetir o no pronto; `--resume` recusado com dono vivo; versao fixa (definicao trocada no meio, a retomada termina na antiga, a nova execucao usa a nova); execucao sem copia usa a atual com `definition_not_pinned`; falha transitoria (HTTP 503 do dublê) que passa na 3a tentativa com espera 0.2 s e 0.4 s; prazo de no e prazo total vencidos; no opcional; `max_parallel`; cancelamento durante um no lento e de execucao orfa; compensacao em ordem inversa e compensacao que falha |
 | `chat` | Conversa de 5 turnos: pesquisa na web, plano + delegacao, resposta pelo historico, aprovacao negada, ferramentas persistidas, streaming e compactacao em resumo |
 
 ## Como funciona
@@ -188,7 +189,8 @@ src/AgentPoc/
   Chat/                     conversa: persistencia, turno, compactacao, CLI
   Web/                      API REST + SSE, aprovacao pela tela; pagina em wwwroot/index.html
   Tools/WebSearch.cs        busca na web (SearXNG, Brave ou DuckDuckGo Lite)
-  Workflows/                motor de grafo (definicao validada, escalonador, condicoes, schema, valores)
+  Workflows/                motor de grafo (definicao validada, escalonador, condicoes, schema, valores,
+                            tentativas, decisao de retomada, compensacao, eventos)
   Queue/Worker.cs           fila com claim atomico, heartbeat e retentativa
   Evidence/                 relatorios de evidencia a partir do banco
 sql/schema.sql, seed.sql    tudo que define comportamento
@@ -242,6 +244,19 @@ sql/schema.sql, seed.sql    tudo que define comportamento
   - *Versao fixa*: cada execucao guarda a copia da definicao (`workflow_runs.definition`); a retomada e as tarefas
     da fila criadas no workflow usam essa copia. Execucao antiga sem copia usa a atual e registra
     `definition_not_pinned`.
+  - *Tentativas*: `"retry": {"max_attempts": 3, "backoff_seconds": 1, "factor": 2, "on": ["error", "timeout"]}` num
+    no `agent` ou `tool`; a espera antes da tentativa n+1 e `backoff * factor^(n-1)` (evento `node_retry`). Ferramenta
+    com efeito colateral so repete se a chamada que falhou nao chegou a comecar.
+  - *Prazos*: `timeout_seconds` no no cancela o run da tentativa e conta como falha `timeout` (`node_timeout`);
+    `timeout_seconds` no topo vira `workflow_runs.deadline_at` (sobrevive a retomada) e, vencido, cancela o que esta
+    rodando e termina `expired` (`workflow_expired`).
+  - *Opcional e paralelismo*: `"optional": true` deixa o no `failed` mas segue o fluxo com o erro como saida
+    (`node_failed_optional`); `max_parallel` no topo limita os nos executando ao mesmo tempo.
+  - *Cancelar e compensar*: `workflow --cancel` grava `cancel_requested_at`; o dono para (heartbeat ou NOTIFY), os
+    runs dos nos ficam `cancelled` e nada novo e iniciado (`workflow_cancelled`); execucao parada ou orfa e
+    cancelada direto, sem retomar. Um no pode ter `"compensate": {"type": "tool", ...}`: se o workflow falha, os nos
+    concluidos com compensacao rodam a dela do ultimo para o primeiro (`compensation_started`, `node_compensated`,
+    `workflow_node_runs.compensated_at`); se uma falha, o status final e `compensation_failed`.
 - **Suspensao duravel**: um run pode parar sem processo preso (`waiting_human`, `waiting_child`), com todo o
   historico no banco. Qualquer instancia com o despachante retoma o mesmo run quando ele fica `ready`.
   Estados: `running` -> `waiting_human` | `waiting_child` -> `ready` -> `running` -> `completed`/... ;
@@ -331,11 +346,11 @@ Com desvio condicional (spec 002): 14 cenarios, 99/99 checagens (inclui `workflo
 `tests/run_restart.sh` e `tests/hitl_restart.sh` OK; `workflow`, `retomada` e `workflow_aprovacao` iguais com o motor
 refeito em volta do escalonador. Testes unitarios: 166.
 
-Com retomada automatica e versao fixa de workflows (spec 003, US1 e US2): 15 cenarios, 105/105 checagens (inclui
-`workflow_resiliente`, 6/6); `tests/workflow_restart.sh` com `kill -9` de verdade (agente de um no retomado no
-MESMO run por um `dispatcher` em outro processo; `run_shell` de um no `tool` nao repete; dois `dispatcher`
-disputando tres execucoes orfas sem duplicar); `tests/run_restart.sh` e `tests/hitl_restart.sh` OK. Testes
-unitarios: 175.
+Com execucao resiliente de workflows (spec 003): 15 cenarios, 115/115 checagens (inclui `workflow_resiliente`,
+16/16); `tests/workflow_restart.sh` com `kill -9` de verdade (agente de um no retomado no MESMO run por um
+`dispatcher` em outro processo; `run_shell` de um no `tool` nao repete; dois `dispatcher` disputando tres execucoes
+orfas sem duplicar); `workflow --cancel` de outro processo parou a execucao em menos de um heartbeat e devolveu
+codigo 1 para execucao ja terminada; `tests/run_restart.sh` e `tests/hitl_restart.sh` OK. Testes unitarios: 185.
 
 Nao testado: contra o Azure Foundry real (inclusive `stream_options` e `reasoning_effort` no deployment)
 e a Brave Search API. O primeiro `dotnet run -- check` com o `.env` preenchido confirma o modelo.
@@ -369,6 +384,11 @@ e a Brave Search API. O primeiro `dotnet run -- check` com o `.env` preenchido c
   (spec 004), o run retomado direto pelo despachante precisara recebe-los.
 - No `tool` com efeito interrompido por queda resolve como pular (registrado em `tool_call_recovered`), porque o
   gate de workflow nao tem pessoa para responder; a pergunta duravel vem com a spec 004.
+- A espera entre tentativas e em memoria: numa queda durante a espera, a retomada recomeca o no (a espera duravel
+  vem com o no `wait`, spec 006). Os nos prontos rodam em lotes, entao `max_parallel` limita cada lote.
+- Compensacao so roda o no declarado em `compensate`; nao desfaz efeitos dos agentes por conta propria. Cancelamento
+  e prazo total vencido nao compensam (so a falha do workflow). Com o dono vivo em outro processo, o cancelamento
+  chega pelo heartbeat (ate `RUN_HEARTBEAT_SECONDS`) ou por NOTIFY quando o dono roda o despachante.
 - Condicoes nao tem aritmetica nem funcoes (so comparacoes e combinacoes); a saida estruturada vem do prompt e da
   validacao local, sem o `response_format` do provedor; nos prontos rodam em lotes (um no `any` espera o lote
   inteiro terminar, nao so o primeiro antecessor).

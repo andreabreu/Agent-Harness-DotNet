@@ -88,15 +88,15 @@ proprio run; no `tool` com efeito interrompido nao repete.
 
 ### Tests for User Story 3 ⚠️
 
-- [ ] T018 [P] [US3] Testes que falham em tests/AgentPoc.Tests/NodeRetryPolicyTests.cs para `NodeRetryPolicy`: padrao = 1 tentativa; `ShouldRetry(attempt, reason, effectStarted, sideEffect)` respeita `max_attempts` e `on`; ferramenta com efeito so repete se o efeito nao comecou; `Wait(attempt)` = backoff * factor^(attempt-1) (1 s, 2 s, 4 s com o padrao)
-- [ ] T019 [P] [US3] Testes que falham em tests/AgentPoc.Tests/WorkflowSchedulerTests.cs: `Next(limit: 2)` com 4 prontos libera 2 e depois mais 2 conforme concluem; no opcional que falhou (`CompleteOptionalFailure`) mantem as arestas ativas
-- [ ] T020 [P] [US3] Testes que falham em tests/AgentPoc.Tests/WorkflowDefinitionTests.cs: `retry` (`max_attempts` 1–10, `backoff_seconds` >= 0, `factor` >= 1, `on` so `error`/`timeout`), `timeout_seconds` > 0 no no e no topo, `optional` booleano, `max_parallel` 1–50, `compensate` com `type` `tool`/`agent` e sem `next`; cada um com erro no formato `<no>.<campo>: <problema>`
-- [ ] T021 [P] [US3] Em tests/mock_llm.py, endpoint `GET /fake/flaky?key=K&until=N` que responde HTTP 503 nas primeiras N-1 chamadas de cada `key` e 200 depois (o `http_get` transforma 503 em `ERRO: HTTP 503`, falha do no `tool`); o cenario usa `--approval auto` explicito, porque URL interna cai em `approval_when`
-- [ ] T022 [US3] Acrescentar a `workflow_resiliente` em src/AgentPoc/Demo.cs, devendo falhar: (a) no `tool` `http_get` para `/fake/flaky?until=3` com `retry.max_attempts = 3`, `backoff_seconds = 0.2`, que falha nas 2 primeiras: `completed`, `attempt = 3`, 2 `node_retry` com esperas 0.2 e 0.4; (b) no `agent` com `timeout_seconds = 2` e o dublê "espere 5 segundos": `node_timeout`, no `failed`, run `cancelled`; (c) no `optional` que falha: `node_failed_optional`, workflow `completed`, no seguinte executou; (d) workflow com `timeout_seconds = 2` e no lento: `expired`, `workflow_expired`; (e) `max_parallel = 2` com 4 nos `tool` paralelos: nunca mais de 2 com intervalos de execucao sobrepostos
-- [ ] T023 [P] [US3] Criar src/AgentPoc/Workflows/NodeRetryPolicy.cs; faz T018 passar
-- [ ] T024 [US3] Em src/AgentPoc/Workflows/WorkflowScheduler.cs, `Next(int? limit)` e falha de no opcional; faz T019 passar
-- [ ] T025 [US3] Em src/AgentPoc/Workflows/WorkflowDefinition.cs, validar e expor os campos novos; faz T020 passar
-- [ ] T026 [US3] Em src/AgentPoc/Workflows/WorkflowEngine.cs: tentativas com `NodeRetryPolicy` (evento `node_retry`, `Task.Delay` da espera, `attempt` incrementado); prazo do no com `CancellationTokenSource` ligado (evento `node_timeout`); `deadline_at` gravado na criacao e verificado a cada lote e no token (status `expired`, evento `workflow_expired`, nos em execucao cancelados); no opcional; `max_parallel`; faz T022 passar
+- [X] T018 [P] [US3] Testes que falham em tests/AgentPoc.Tests/NodeRetryPolicyTests.cs para `NodeRetryPolicy`: padrao = 1 tentativa; `ShouldRetry(attempt, reason, effectStarted, sideEffect)` respeita `max_attempts` e `on`; ferramenta com efeito so repete se o efeito nao comecou; `Wait(attempt)` = backoff * factor^(attempt-1) (1 s, 2 s, 4 s com o padrao)
+- [X] T019 [P] [US3] Testes que falham em tests/AgentPoc.Tests/WorkflowSchedulerTests.cs: `Next(limit: 2)` com 4 prontos libera 2 e depois mais 2 conforme concluem; no opcional que falhou (`CompleteOptionalFailure`) mantem as arestas ativas
+- [X] T020 [P] [US3] Testes que falham em tests/AgentPoc.Tests/WorkflowDefinitionTests.cs: `retry` (`max_attempts` 1–10, `backoff_seconds` >= 0, `factor` >= 1, `on` so `error`/`timeout`), `timeout_seconds` > 0 no no e no topo, `optional` booleano, `max_parallel` 1–50, `compensate` com `type` `tool`/`agent` e sem `next`; cada um com erro no formato `<no>.<campo>: <problema>`
+- [X] T021 [P] [US3] Em tests/mock_llm.py, endpoint `GET /fake/flaky?key=K&until=N` que responde HTTP 503 nas primeiras N-1 chamadas de cada `key` e 200 depois (o `http_get` transforma 503 em `ERRO: HTTP 503`, falha do no `tool`); o cenario usa `--approval auto` explicito, porque URL interna cai em `approval_when`
+- [X] T022 [US3] Acrescentar a `workflow_resiliente` em src/AgentPoc/Demo.cs, devendo falhar: (a) no `tool` `http_get` para `/fake/flaky?until=3` com `retry.max_attempts = 3`, `backoff_seconds = 0.2`, que falha nas 2 primeiras: `completed`, `attempt = 3`, 2 `node_retry` com esperas 0.2 e 0.4; (b) no `agent` com `timeout_seconds = 2` e o dublê "espere 5 segundos": `node_timeout`, no `failed`, run `cancelled`; (c) no `optional` que falha: `node_failed_optional`, workflow `completed`, no seguinte executou; (d) workflow com `timeout_seconds = 2` e no lento: `expired`, `workflow_expired`; (e) `max_parallel = 2` com 4 nos `tool` paralelos: nunca mais de 2 com intervalos de execucao sobrepostos
+- [X] T023 [P] [US3] Criar src/AgentPoc/Workflows/NodeRetryPolicy.cs; faz T018 passar
+- [X] T024 [US3] Em src/AgentPoc/Workflows/WorkflowScheduler.cs, `Next(int? limit)` e falha de no opcional; faz T019 passar
+- [X] T025 [US3] Em src/AgentPoc/Workflows/WorkflowDefinition.cs, validar e expor os campos novos; faz T020 passar
+- [X] T026 [US3] Em src/AgentPoc/Workflows/WorkflowEngine.cs: tentativas com `NodeRetryPolicy` (evento `node_retry`, `Task.Delay` da espera, `attempt` incrementado); prazo do no com `CancellationTokenSource` ligado (evento `node_timeout`); `deadline_at` gravado na criacao e verificado a cada lote e no token (status `expired`, evento `workflow_expired`, nos em execucao cancelados); no opcional; `max_parallel`; faz T022 passar
 
 **Checkpoint**: US1–US3.
 
@@ -110,13 +110,13 @@ proprio run; no `tool` com efeito interrompido nao repete.
 
 ### Tests for User Story 4 ⚠️
 
-- [ ] T027 [P] [US4] Testes que falham em tests/AgentPoc.Tests/WorkflowSchedulerTests.cs (ou em um `CompensationPlan` puro): ordem de compensacao = nos concluidos com `compensate`, ordem inversa de conclusao, sem os ja compensados
-- [ ] T028 [US4] Acrescentar a `workflow_resiliente` em src/AgentPoc/Demo.cs, devendo falhar: (a) cancelamento pedido durante um no lento (agente "espere 5 segundos"): `cancelled`, `workflow_cancelled`, run do agente `cancelled`, no seguinte nunca iniciou; (b) cancelamento de execucao `ready`/orfa: marcada `cancelled` pela varredura sem ser retomada; (c) A e B (tool `kb_search`) com `compensate` e C falhando: `compensation_started`, `node_compensated` de B e depois de A, workflow `failed`; (d) compensacao que falha: `compensation_failed`
+- [X] T027 [P] [US4] Testes que falham em tests/AgentPoc.Tests/WorkflowSchedulerTests.cs (ou em um `CompensationPlan` puro): ordem de compensacao = nos concluidos com `compensate`, ordem inversa de conclusao, sem os ja compensados
+- [X] T028 [US4] Acrescentar a `workflow_resiliente` em src/AgentPoc/Demo.cs, devendo falhar: (a) cancelamento pedido durante um no lento (agente "espere 5 segundos"): `cancelled`, `workflow_cancelled`, run do agente `cancelled`, no seguinte nunca iniciou; (b) cancelamento de execucao `ready`/orfa: marcada `cancelled` pela varredura sem ser retomada; (c) A e B (tool `kb_search`) com `compensate` e C falhando: `compensation_started`, `node_compensated` de B e depois de A, workflow `failed`; (d) compensacao que falha: `compensation_failed`
 
 ### Implementation for User Story 4
 
-- [ ] T029 [US4] Em src/AgentPoc/Workflows/WorkflowEngine.cs: `CancelAsync(workflowRunId)` grava `cancel_requested_at` e `NOTIFY`; o keeper sinaliza `CancelRequested` e o motor cancela o token, marca `cancelled` e registra `workflow_cancelled`; a varredura de `IWorkflowRecovery` cancela `ready`/orfas com pedido; compensacao com `compensated_at` (retomavel), eventos e status `compensation_failed`; faz T027 e T028 passarem
-- [ ] T030 [US4] Em src/AgentPoc/Program.cs, `workflow --cancel <id>` (codigo 1 para execucao terminada) e ajuda atualizada
+- [X] T029 [US4] Em src/AgentPoc/Workflows/WorkflowEngine.cs: `CancelAsync(workflowRunId)` grava `cancel_requested_at` e `NOTIFY`; o keeper sinaliza `CancelRequested` e o motor cancela o token, marca `cancelled` e registra `workflow_cancelled`; a varredura de `IWorkflowRecovery` cancela `ready`/orfas com pedido; compensacao com `compensated_at` (retomavel), eventos e status `compensation_failed`; faz T027 e T028 passarem
+- [X] T030 [US4] Em src/AgentPoc/Program.cs, `workflow --cancel <id>` (codigo 1 para execucao terminada) e ajuda atualizada
 
 **Checkpoint**: todas as historias.
 
@@ -124,10 +124,10 @@ proprio run; no `tool` com efeito interrompido nao repete.
 
 ## Phase 7: Polish & Cross-Cutting Concerns
 
-- [ ] T031 [P] Atualizar README.md: "Como funciona" (lease e retomada automatica de workflows, versao fixa, `retry`, prazos, `optional`, `max_parallel`, cancelamento, compensacao, `workflow_events`); comandos (`--cancel`); cenarios (`workflow_resiliente`) e scripts (`tests/workflow_restart.sh`); "Limitacoes" (espera entre tentativas em memoria; pergunta de no com efeito resolve como pular ate a 004; compensacao nao desfaz efeitos de agentes, so roda o no declarado)
-- [ ] T032 Regressao completa: `dotnet test`, `demo all`, `tests/run_restart.sh`, `tests/hitl_restart.sh`, `tests/workflow_restart.sh`; registrar a comparacao com T001 no quickstart
-- [ ] T033 Revisar o Constitution Check do plan.md, registrar desvios em "Desvios na implementacao" e marcar as tarefas concluidas
-- [ ] T034 Commit `feat: execucao resiliente de workflows` com autor André Abreu <andre.abreu@live.com>, sem co-autores e sem push
+- [X] T031 [P] Atualizar README.md: "Como funciona" (lease e retomada automatica de workflows, versao fixa, `retry`, prazos, `optional`, `max_parallel`, cancelamento, compensacao, `workflow_events`); comandos (`--cancel`); cenarios (`workflow_resiliente`) e scripts (`tests/workflow_restart.sh`); "Limitacoes" (espera entre tentativas em memoria; pergunta de no com efeito resolve como pular ate a 004; compensacao nao desfaz efeitos de agentes, so roda o no declarado)
+- [X] T032 Regressao completa: `dotnet test`, `demo all`, `tests/run_restart.sh`, `tests/hitl_restart.sh`, `tests/workflow_restart.sh`; registrar a comparacao com T001 no quickstart
+- [X] T033 Revisar o Constitution Check do plan.md, registrar desvios em "Desvios na implementacao" e marcar as tarefas concluidas
+- [X] T034 Commit `feat: execucao resiliente de workflows` com autor André Abreu <andre.abreu@live.com>, sem co-autores e sem push
 
 ---
 

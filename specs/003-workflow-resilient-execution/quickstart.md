@@ -52,3 +52,14 @@ cd ../.. && tests/run_restart.sh && tests/hitl_restart.sh
 ```
 
 Esperado: 14 cenarios anteriores (99 checagens) e os scripts com `RESULTADO: OK`.
+
+## Resultado (2026-11-08)
+
+| Verificacao | Linha de base (T001) | Depois da 003 |
+|---|---|---|
+| `dotnet test` | 166 | 185 |
+| `demo all` | 14 cenarios, 99/99 | 15 cenarios, 115/115 (`workflow_resiliente` 16/16) |
+| `tests/run_restart.sh` | OK | OK |
+| `tests/hitl_restart.sh` | OK | OK |
+| `tests/workflow_restart.sh` | (nao existia) | OK nas 3 partes |
+| `workflow --cancel` entre processos | (nao existia) | cancelado em ~40 ms com `RUN_HEARTBEAT_SECONDS=1`; codigo 1 para execucao terminada |

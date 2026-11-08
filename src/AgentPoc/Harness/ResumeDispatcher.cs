@@ -54,6 +54,9 @@ public interface IWorkflowRecovery
 
     /// <summary>Reivindica uma execucao ready e a continua ate o fim. False se nao havia nenhuma.</summary>
     Task<bool> ResumeNextAsync(CancellationToken ct);
+
+    /// <summary>Pedido de cancelamento recebido por NOTIFY: para a execucao se ela roda nesta instancia.</summary>
+    void CancelRunning(Guid workflowRunId);
 }
 
 /// <summary>Sinal para acordar quem espera (NOTIFY recebido), com tempo limite para a varredura periodica.</summary>
@@ -147,7 +150,11 @@ public sealed class ResumeDispatcher
     private void OnNotification(string channel, string payload)
     {
         if (channel == RunChain.ReadyChannel) _wakeup.Pulse();
-        else if (channel == RunChain.CancelChannel && Guid.TryParse(payload, out var root)) _executions.Cancel(root);
+        else if (channel == RunChain.CancelChannel && Guid.TryParse(payload, out var id))
+        {
+            _executions.Cancel(id);
+            _workflows?.CancelRunning(id);
+        }
     }
 
     private async Task WorkAsync(TimeSpan sweepInterval, CancellationToken ct)

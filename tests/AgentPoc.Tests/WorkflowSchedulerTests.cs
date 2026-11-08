@@ -173,4 +173,18 @@ public class WorkflowSchedulerTests
         Assert.Empty(s.Next().Ready);
         Assert.False(s.HasPending);
     }
+
+    [Fact]
+    public void Limit_releases_at_most_that_many_running_nodes_in_definition_order()
+    {
+        var s = Scheduler($$"""{"a": {{Tool("")}}, "b": {{Tool("")}}, "c": {{Tool("")}}, "d": {{Tool("")}}}""");
+
+        Assert.Equal(new[] { "a", "b" }, s.Next(limit: 2).Ready);
+        Assert.Empty(s.Next(limit: 2).Ready);
+        s.Complete("a");
+        Assert.Equal(new[] { "c" }, s.Next(limit: 2).Ready);
+        s.Complete("b");
+        s.Complete("c");
+        Assert.Equal(new[] { "d" }, s.Next(limit: 2).Ready);
+    }
 }

@@ -21,6 +21,14 @@ public sealed record WorkflowNode(string Id, string Type, IReadOnlyList<string> 
 {
     public IReadOnlyList<ConditionCase> Cases { get; init; } = Array.Empty<ConditionCase>();
     public IReadOnlyList<string> Default { get; init; } = Array.Empty<string>();
+    public NodeRetryPolicy Retry { get; init; } = NodeRetryPolicy.Default;
+    public int? TimeoutSeconds { get; init; }
+
+    /// <summary>Falha definitiva nao derruba o workflow: o no fica failed e os seguintes rodam com o erro como saida.</summary>
+    public bool Optional { get; init; }
+
+    /// <summary>No que desfaz este (tool ou agent, sem destinos), executado se o workflow falhar depois dele.</summary>
+    public WorkflowNode? Compensate { get; init; }
 
     public bool IsCondition => Type == WorkflowNodeType.Condition;
 
@@ -43,6 +51,8 @@ public sealed class WorkflowDefinition
 {
     public const int DefaultOutputRetries = 2;
     private const int MaxOutputRetries = 5;
+    private const int MaxParallelLimit = 50;
+    private static readonly string[] ExecutingTypes = { WorkflowNodeType.Agent, WorkflowNodeType.Tool };
     private static readonly Dictionary<string, JoinMode> Joins = new()
     {
         ["all"] = JoinMode.All, ["all_active"] = JoinMode.AllActive, ["any"] = JoinMode.Any
@@ -54,6 +64,12 @@ public sealed class WorkflowDefinition
     public IReadOnlyDictionary<string, WorkflowNode> Nodes { get; }
     public JsonNode? InputSchema { get; }
     public JsonNode? Output { get; }
+
+    /// <summary>Maximo de nos executando ao mesmo tempo; nulo, sem limite.</summary>
+    public int? MaxParallel { get; private init; }
+
+    /// <summary>Prazo total da execucao; nulo, sem prazo.</summary>
+    public int? TimeoutSeconds { get; private init; }
 
     private WorkflowDefinition(List<WorkflowNode> nodes, JsonNode? inputSchema, JsonNode? output)
     {
@@ -82,9 +98,11 @@ public sealed class WorkflowDefinition
         if (inputSchema != null) errors.AddRange(JsonSchemaLite.CheckSupported(inputSchema, "input_schema"));
         var output = definition["output"];
         CheckReferences(output, "output", ids, errors);
+        var maxParallel = IntField(definition, "max_parallel", "max_parallel", 1, MaxParallelLimit, $"use um inteiro de 1 a {MaxParallelLimit}", errors);
+        var timeout = PositiveSeconds(definition, "timeout_seconds", errors);
 
         if (errors.Count > 0) throw new WorkflowDefinitionException(workflowId, errors);
-        return new WorkflowDefinition(nodes, inputSchema, output);
+        return new WorkflowDefinition(nodes, inputSchema, output) { MaxParallel = maxParallel, TimeoutSeconds = timeout };
     }
 
     private static WorkflowNode? ParseNode(string id, JsonNode? raw, HashSet<string> ids, List<string> errors)
@@ -117,7 +135,65 @@ public sealed class WorkflowDefinition
             WorkflowNodeType.Transform => Transform(id, node, ids, errors),
             _ => End(id, node, ids, errors)
         };
-        return parsed with { Next = parsed.IsCondition ? parsed.Next : next, Join = join };
+        return WithResilience(parsed, node, ids, errors) with { Next = parsed.IsCondition ? parsed.Next : next, Join = join };
+    }
+
+    /// <summary>retry, timeout_seconds, optional e compensate: so em nos que executam (agent, tool).</summary>
+    private static WorkflowNode WithResilience(WorkflowNode parsed, JsonObject node, HashSet<string> ids, List<string> errors)
+    {
+        var id = parsed.Id;
+        var fields = new[] { "retry", "timeout_seconds", "optional", "compensate" }.Where(node.ContainsKey).ToList();
+        if (!ExecutingTypes.Contains(parsed.Type))
+        {
+            errors.AddRange(fields.Select(f => $"{id}.{f}: so em nos agent e tool"));
+            return parsed;
+        }
+        var retryErrors = NodeRetryPolicy.Validate(node["retry"], $"{id}.retry").ToList();
+        errors.AddRange(retryErrors);
+        var optional = node["optional"] is { } rawOptional && rawOptional.GetValueKind() is not (JsonValueKind.True or JsonValueKind.False)
+            ? Invalid(errors, $"{id}.optional: use true ou false", false)
+            : node["optional"]?.GetValue<bool>() ?? false;
+        return parsed with
+        {
+            Retry = retryErrors.Count > 0 ? NodeRetryPolicy.Default : NodeRetryPolicy.From(node["retry"]),
+            TimeoutSeconds = PositiveSeconds(node, "timeout_seconds", errors, id),
+            Optional = optional,
+            Compensate = node["compensate"] is { } compensate ? CompensationNode(id, compensate, ids, errors) : null
+        };
+    }
+
+    private static WorkflowNode? CompensationNode(string id, JsonNode raw, HashSet<string> ids, List<string> errors)
+    {
+        var at = $"{id}.compensate";
+        if (raw is not JsonObject node)
+        {
+            errors.Add($"{at}: deve ser um objeto");
+            return null;
+        }
+        if (node.ContainsKey("next")) errors.Add($"{at}.next: a compensacao nao tem destinos");
+        return TextOf(node, "type") switch
+        {
+            WorkflowNodeType.Tool => Tool(at, node, ids, errors),
+            WorkflowNodeType.Agent => Agent(at, node, ids, errors),
+            _ => Invalid<WorkflowNode?>(errors, $"{at}.type: use {WorkflowNodeType.Tool} ou {WorkflowNodeType.Agent}", null)
+        };
+    }
+
+    private static T Invalid<T>(List<string> errors, string error, T fallback)
+    {
+        errors.Add(error);
+        return fallback;
+    }
+
+    private static int? PositiveSeconds(JsonObject node, string key, List<string> errors, string? id = null) =>
+        IntField(node, key, id == null ? key : $"{id}.{key}", 1, int.MaxValue, "use um inteiro maior que zero", errors);
+
+    private static int? IntField(JsonObject node, string key, string at, int min, int max, string problem, List<string> errors)
+    {
+        if (node[key] is not { } raw) return null;
+        if (NodeRetryPolicy.TryInt(raw, out var value) && value >= min && value <= max) return value;
+        errors.Add($"{at}: {problem}");
+        return null;
     }
 
     private static WorkflowNode Agent(string id, JsonObject node, HashSet<string> ids, List<string> errors)
@@ -218,4 +294,7 @@ public static class WorkflowRunStatus
 {
     public const string Completed = "completed";
     public const string Failed = "failed";
+    public const string Cancelled = "cancelled";
+    public const string Expired = "expired";
+    public const string CompensationFailed = "compensation_failed";
 }

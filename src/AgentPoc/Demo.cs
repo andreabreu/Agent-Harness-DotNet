@@ -66,10 +66,12 @@ public static class Demo
             "condition escolhe o ramo e os outros ficam pulados; a consolidacao junta so os ramos ativos; uma queda depois do " +
             "desvio e retomada no mesmo ramo sem chamar o classificador de novo; entrada tipada, transform e end fecham o fluxo.",
             new ScenarioFn(WorkflowDesvio)),
-        ("workflow_resiliente", "Execucao resiliente de workflows: retomada automatica e versao fixa",
+        ("workflow_resiliente", "Execucao resiliente de workflows: retomada, versao fixa, tentativas, prazos, cancelamento e compensacao",
             "Uma execucao cujo dono morreu (lease vencido) e recuperada pelo despachante e concluida sem repetir os nos " +
-            "prontos; uma execucao termina com a definicao com que comecou mesmo que o workflow mude no meio, e uma " +
-            "execucao antiga sem copia da definicao usa a atual e registra isso.", new ScenarioFn(WorkflowResiliente)),
+            "prontos; uma execucao termina com a definicao com que comecou mesmo que o workflow mude no meio. Uma falha " +
+            "transitoria passa na 3a tentativa com espera crescente; prazos de no e de workflow cancelam o que esta " +
+            "rodando; um no opcional que falha nao derruba o fluxo; max_parallel limita os nos simultaneos; o " +
+            "cancelamento para tudo; e uma falha desfaz os passos concluidos em ordem inversa.", new ScenarioFn(WorkflowResiliente)),
     };
 
     private static readonly TimeSpan DemoDispatcherSweep = TimeSpan.FromSeconds(1);
@@ -956,6 +958,182 @@ public static class Demo
         }
     }
 
+    private static readonly WorkflowApprovalMode ExplicitAuto = new("auto", true);
+
+    private static string FlakyUrl(int until) =>
+        $"http://localhost:{(Env.Get("MOCK_LLM_PORT") is { Length: > 0 } port ? port : "8765")}/fake/flaky?key={Guid.NewGuid():N}&until={until}";
+
+    private static System.Text.Json.Nodes.JsonObject FlakyNode(int until) => new()
+    {
+        ["type"] = "tool", ["tool"] = "http_get", ["args"] = new System.Text.Json.Nodes.JsonObject { ["url"] = FlakyUrl(until) }
+    };
+
+    private static System.Text.Json.Nodes.JsonObject SlowAgentNode() => new()
+    {
+        ["type"] = "agent", ["agent"] = "assistant", ["input"] = "espere 5 segundos e responda"
+    };
+
+    private static System.Text.Json.Nodes.JsonObject KbNode(string query) => new()
+    {
+        ["type"] = "tool", ["tool"] = "kb_search", ["args"] = new System.Text.Json.Nodes.JsonObject { ["query"] = query }
+    };
+
+    /// <summary>O no com os campos de <paramref name="fieldsJson"/> acrescentados (retry, optional, next...).</summary>
+    private static System.Text.Json.Nodes.JsonObject With(System.Text.Json.Nodes.JsonObject node, string fieldsJson)
+    {
+        foreach (var (key, value) in System.Text.Json.Nodes.JsonNode.Parse(fieldsJson)!.AsObject()) node[key] = value?.DeepClone();
+        return node;
+    }
+
+    private static string DemoDefinition(string topJson, params (string Id, System.Text.Json.Nodes.JsonObject Node)[] nodes)
+    {
+        var definition = System.Text.Json.Nodes.JsonNode.Parse(topJson)!.AsObject();
+        var all = new System.Text.Json.Nodes.JsonObject();
+        foreach (var (id, node) in nodes) all[id] = node;
+        definition["nodes"] = all;
+        return definition.ToJsonString();
+    }
+
+    private static async Task<WorkflowResult> RunDemoWorkflowAsync(App app, EvidenceSession s, string id, string definition, CancellationToken ct)
+    {
+        await SaveDemoWorkflowAsync(app, id, definition);
+        var result = await app.Workflows.RunAsync(id, "cenario workflow_resiliente", approval: ExplicitAuto, ct: ct);
+        s.WorkflowRuns.Add(result.WorkflowRunId);
+        return result;
+    }
+
+    private static async Task<string?> LastNodeRunStatusAsync(App app, Guid wfRunId, string node) =>
+        (string?)await app.Db.ScalarAsync(
+            "select status from runs where workflow_run_id = @w and workflow_node_id = @n order by started_at desc limit 1", ("w", wfRunId), ("n", node));
+
+    /// <summary>Maior numero de nos com intervalos de execucao sobrepostos na execucao.</summary>
+    private static async Task<long> MaxConcurrentNodesAsync(App app, Guid wfRunId) =>
+        Convert.ToInt64(await app.Db.ScalarAsync(
+            @"select coalesce(max(c), 0) from (
+                  select (select count(*) from workflow_node_runs o
+                           where o.workflow_run_id = n.workflow_run_id and o.started_at <= n.started_at and o.finished_at > n.started_at) as c
+                    from workflow_node_runs n where n.workflow_run_id = @w) x", ("w", wfRunId)));
+
+    private static async Task WorkflowResilienteFalhas(App app, EvidenceSession s, CancellationToken ct)
+    {
+        WorkflowResult? retried = null, timedOut = null, optional = null, expired = null, parallel = null;
+        Dictionary<string, (string Status, int Attempt)> retriedNodes = new(), timedOutNodes = new(), optionalNodes = new();
+        List<System.Text.Json.Nodes.JsonObject> retries = new(), timeouts = new(), optionalFailures = new(), expirations = new();
+        string? timedOutRun = null;
+        long maxConcurrent = -1;
+
+        s.Checks.Add(new Check("Falha transitoria: 3 tentativas, 2 node_retry com espera 0.2 s e 0.4 s, workflow completed",
+            _ => retried?.Status == "completed" && retriedNodes.GetValueOrDefault("buscar") == ("completed", 3) &&
+                 retries.Select(r => r["wait_seconds"]?.GetValue<double>()).SequenceEqual(new double?[] { 0.2, 0.4 })));
+        s.Checks.Add(new Check("Prazo do no (2 s) com agente que demora 5 s: node_timeout, no failed, run do agente cancelled",
+            _ => timeouts.Count == 1 && timedOutNodes.GetValueOrDefault("lento").Status == "failed" && timedOutRun == "cancelled" &&
+                 timedOut?.Status == "failed"));
+        s.Checks.Add(new Check("No opcional que falha: node_failed_optional, o seguinte executou e o workflow terminou completed",
+            _ => optional?.Status == "completed" && optionalFailures.Count == 1 && optionalNodes.GetValueOrDefault("falha").Status == "failed" &&
+                 optionalNodes.GetValueOrDefault("depois").Status == "completed"));
+        s.Checks.Add(new Check("Prazo total do workflow (2 s) vencido: expired e workflow_expired",
+            _ => expired?.Status == "expired" && expirations.Count == 1));
+        s.Checks.Add(new Check("max_parallel 2 com 4 ramos prontos: nunca mais de 2 nos executando ao mesmo tempo",
+            _ => parallel?.Status == "completed" && maxConcurrent == 2));
+
+        retried = await RunDemoWorkflowAsync(app, s, "demo_resiliente_retry",
+            DemoDefinition("{}", ("buscar", With(FlakyNode(3), """{"retry": {"max_attempts": 3, "backoff_seconds": 0.2}}"""))), ct);
+        retriedNodes = await NodesAsync(app, retried.WorkflowRunId);
+        retries = await WorkflowEventsAsync(app, retried.WorkflowRunId, WorkflowEvents.NodeRetry);
+
+        timedOut = await RunDemoWorkflowAsync(app, s, "demo_resiliente_prazo_no",
+            DemoDefinition("{}", ("lento", With(SlowAgentNode(), """{"timeout_seconds": 2}"""))), ct);
+        timedOutNodes = await NodesAsync(app, timedOut.WorkflowRunId);
+        timeouts = await WorkflowEventsAsync(app, timedOut.WorkflowRunId, WorkflowEvents.NodeTimeout);
+        timedOutRun = await LastNodeRunStatusAsync(app, timedOut.WorkflowRunId, "lento");
+
+        optional = await RunDemoWorkflowAsync(app, s, "demo_resiliente_opcional",
+            DemoDefinition("{}", ("falha", With(FlakyNode(99), """{"optional": true, "next": ["depois"]}""")), ("depois", KbNode("{{falha}}"))), ct);
+        optionalNodes = await NodesAsync(app, optional.WorkflowRunId);
+        optionalFailures = await WorkflowEventsAsync(app, optional.WorkflowRunId, WorkflowEvents.NodeFailedOptional);
+
+        expired = await RunDemoWorkflowAsync(app, s, "demo_resiliente_prazo_total",
+            DemoDefinition("""{"timeout_seconds": 2}""", ("lento", SlowAgentNode())), ct);
+        expirations = await WorkflowEventsAsync(app, expired.WorkflowRunId, WorkflowEvents.Expired);
+
+        System.Text.Json.Nodes.JsonObject WaitNode() => With(KbNode("x"), """{"tool": "wait_seconds", "args": {"seconds": 1}}""");
+        parallel = await RunDemoWorkflowAsync(app, s, "demo_resiliente_paralelo",
+            DemoDefinition("""{"max_parallel": 2}""", ("p1", WaitNode()), ("p2", WaitNode()), ("p3", WaitNode()), ("p4", WaitNode())), ct);
+        maxConcurrent = await MaxConcurrentNodesAsync(app, parallel.WorkflowRunId);
+    }
+
+    private static async Task WorkflowResilienteCancelamento(App app, EvidenceSession s, CancellationToken ct)
+    {
+        WorkflowResult? cancelled = null, compensated = null, compensationFailed = null;
+        string? cancelledRun = null, orphanStatus = null;
+        Dictionary<string, (string Status, int Attempt)> cancelledNodes = new(), orphanNodes = new();
+        List<System.Text.Json.Nodes.JsonObject> cancelEvents = new(), orphanRecovered = new(), compensations = new(), compensationFailures = new();
+        long compensationStarted = 0;
+
+        s.Checks.Add(new Check("Cancelamento durante no lento: cancelled, workflow_cancelled, run do agente cancelled, no seguinte nao iniciou",
+            _ => cancelled?.Status == "cancelled" && cancelEvents.Count == 1 && cancelledRun == "cancelled" && !cancelledNodes.ContainsKey("depois")));
+        s.Checks.Add(new Check("Execucao orfa com pedido de cancelamento: a varredura marcou cancelled sem retomar",
+            _ => orphanStatus == "cancelled" && orphanRecovered.Count == 0 && !orphanNodes.ContainsKey("b")));
+        s.Checks.Add(new Check("A e B com compensacao e C falhando: compensation_started, B e depois A compensados, workflow failed",
+            _ => compensated?.Status == "failed" && compensationStarted == 1 &&
+                 compensations.Select(c => c["node"]?.GetValue<string>()).SequenceEqual(new[] { "b", "a" })));
+        s.Checks.Add(new Check("Compensacao que falha: compensation_failed (status e evento)",
+            _ => compensationFailed?.Status == "compensation_failed" && compensationFailures.Count == 1));
+
+        await SaveDemoWorkflowAsync(app, "demo_resiliente_cancela",
+            DemoDefinition("{}", ("lento", With(SlowAgentNode(), """{"next": ["depois"]}""")), ("depois", KbNode("x"))));
+        var running = app.Workflows.RunAsync("demo_resiliente_cancela", "cenario workflow_resiliente", approval: ExplicitAuto, ct: ct);
+        var cancelId = await WaitNodeRunningAsync(app, "demo_resiliente_cancela", "lento", ct);
+        Log.Write(0, ConsoleColor.Yellow, "cancela", $"pedindo cancelamento de {Text.Short(cancelId)} com o no 'lento' executando");
+        await app.Workflows.CancelAsync(cancelId);
+        cancelled = await running;
+        s.WorkflowRuns.Add(cancelled.WorkflowRunId);
+        cancelledNodes = await NodesAsync(app, cancelId);
+        cancelEvents = await WorkflowEventsAsync(app, cancelId, WorkflowEvents.Cancelled);
+        cancelledRun = await LastNodeRunStatusAsync(app, cancelId, "lento");
+
+        await SaveDemoWorkflowAsync(app, "demo_resiliente_orfa", TwoStepWorkflow);
+        var orphan = await CrashAfterAsync(app, s, "demo_resiliente_orfa", "a", ct);
+        await app.Db.ExecAsync(
+            @"update workflow_runs set status = 'running', owner = 'instancia-morta', lease_until = now() - interval '1 minute',
+                     cancel_requested_at = now() where id = @id", ("id", orphan));
+        await WithDispatcherAsync(app, ct, () => WaitWorkflowFinishedAsync(app, orphan, ct));
+        orphanStatus = await WorkflowStatusAsync(app, orphan);
+        orphanNodes = await NodesAsync(app, orphan);
+        orphanRecovered = await WorkflowEventsAsync(app, orphan, WorkflowEvents.Recovered);
+
+        const string undo = """{"compensate": {"type": "tool", "tool": "kb_search", "args": {"query": "desfazer"}}}""";
+        compensated = await RunDemoWorkflowAsync(app, s, "demo_resiliente_compensa",
+            DemoDefinition("{}", ("a", With(With(KbNode("a"), undo), """{"next": ["b"]}""")),
+                                 ("b", With(With(KbNode("b"), undo), """{"next": ["c"]}""")),
+                                 ("c", FlakyNode(99))), ct);
+        compensations = await WorkflowEventsAsync(app, compensated.WorkflowRunId, WorkflowEvents.NodeCompensated);
+        compensationStarted = (await WorkflowEventsAsync(app, compensated.WorkflowRunId, WorkflowEvents.CompensationStarted)).Count;
+
+        var failingUndo = With(KbNode("a"), """{"next": ["b"]}""");
+        failingUndo["compensate"] = FlakyNode(99);
+        compensationFailed = await RunDemoWorkflowAsync(app, s, "demo_resiliente_compensa_falha",
+            DemoDefinition("{}", ("a", failingUndo), ("b", FlakyNode(99))), ct);
+        compensationFailures = await WorkflowEventsAsync(app, compensationFailed.WorkflowRunId, WorkflowEvents.CompensationFailed);
+    }
+
+    private static async Task<Guid> WaitNodeRunningAsync(App app, string workflowId, string node, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + RecoveryTimeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (await app.Db.ScalarAsync(
+                    @"select w.id from workflow_runs w join workflow_node_runs n on n.workflow_run_id = w.id
+                       where w.workflow_id = @wf and w.status = 'running' and n.node_id = @n and n.status = 'running'
+                         and exists (select 1 from runs r join run_events e on e.run_id = r.id
+                                      where r.workflow_run_id = w.id and e.type = 'tool_call_started')
+                       order by w.started_at desc limit 1", ("wf", workflowId), ("n", node)) is Guid id)
+                return id;
+            await Task.Delay(100, ct);
+        }
+        throw new TimeoutException($"no '{node}' de '{workflowId}' nao comecou a executar.");
+    }
+
     private static async Task WorkflowResiliente(App app, EvidenceSession s, CancellationToken ct)
     {
         Approval.Mode = "auto";
@@ -963,6 +1141,8 @@ public static class Demo
         List<System.Text.Json.Nodes.JsonObject> recovered = new(), notPinned = new();
         string orphanStatus = "", pinnedStatus = "";
         string? liveOwnerRefusal = null;
+        var allPartsRan = false;
+        s.Checks.Add(new Check("Todas as partes do cenario executaram ate o fim", _ => allPartsRan));
 
         s.Checks.Add(new Check("Execucao orfa (dono morto, lease vencido) recuperada pelo despachante e concluida",
             _ => orphanStatus == "completed" && recovered.Count == 1 && recovered[0]["previous_owner"]?.GetValue<string>() == "instancia-morta"));
@@ -1013,6 +1193,10 @@ public static class Demo
         await app.Workflows.RunAsync("", null, resumeRunId: unpinned, ct: ct);
         unpinnedNodes = await NodesAsync(app, unpinned);
         notPinned = await WorkflowEventsAsync(app, unpinned, WorkflowEvents.DefinitionNotPinned);
+
+        await WorkflowResilienteFalhas(app, s, ct);
+        await WorkflowResilienteCancelamento(app, s, ct);
+        allPartsRan = true;
     }
 
     private sealed class CountingObserver : IRunObserver

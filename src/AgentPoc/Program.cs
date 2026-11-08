@@ -110,6 +110,26 @@ try
             await app.Dispatcher.RunAsync(n, app.Lease.Sweep, cts.Token);
             break;
         }
+        case "workflow" when Opt("cancel") is { } cancelArg:
+        {
+            if (!Guid.TryParse(cancelArg, out var cancelId)) { Help(); return 1; }
+            var outcome = await app.Workflows.CancelAsync(cancelId);
+            switch (outcome)
+            {
+                case AgentPoc.Workflows.WorkflowCancelResult.Cancelled:
+                    Log.Ok($"workflow run {cancelId} cancelado (estava parado, sem dono vivo).");
+                    break;
+                case AgentPoc.Workflows.WorkflowCancelResult.Requested:
+                    Log.Ok($"Cancelamento pedido para {cancelId}; a instancia dona para no proximo heartbeat.");
+                    break;
+                default:
+                    Log.Error(outcome == AgentPoc.Workflows.WorkflowCancelResult.NotFound
+                        ? $"workflow run {cancelId} nao encontrado."
+                        : $"workflow run {cancelId} ja terminou; nada a cancelar.");
+                    return 1;
+            }
+            break;
+        }
         case "workflow":
         {
             Guid? resume = Guid.TryParse(Opt("resume"), out var g) ? g : null;
@@ -274,10 +294,12 @@ void Help()
       task <agente> "<texto>"           roda um agente (aprovacao interativa por padrao)
            [--budget N] [--approval auto|deny|ask]
       workflow <id> "<entrada>"         roda um workflow  [--crash-after <no>]
-      workflow --resume <workflow_run>  retoma um workflow interrompido
+      workflow --resume <workflow_run>  retoma um workflow interrompido (recusado se outra instancia ainda e dona)
+      workflow --cancel <workflow_run>  cancela um workflow (codigo 1 se ja terminou)
            [--approval deny|auto|ask]   padrao deny: sem modo informado, nega ferramentas de aprovacao
       worker [--concurrency N] [--once] processa a fila de tarefas
       dispatcher [--concurrency N]      so retoma runs prontos (decisao humana, prazo vencido, filho terminou)
+                                        e execucoes de workflow orfas (lease vencido)
       demo [autonomia|workflow|fila|governanca|retomada|all]
                                         roda os cenarios e grava evidencias em ./evidence
       report <run_id|workflow_run_id>   gera evidencia de qualquer execucao gravada

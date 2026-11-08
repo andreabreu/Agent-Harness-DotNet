@@ -20,6 +20,7 @@ import re
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 PORT = int(os.environ.get("MOCK_LLM_PORT", "8765"))
 LATENCY = float(os.environ.get("MOCK_LLM_LATENCY", "0.3"))
@@ -410,12 +411,15 @@ def decide(c):
     return "Sou um dublê de LLM e nao reconheci este agente."
 
 
+FLAKY_CALLS = {}  # /fake/flaky: chamadas por key (503 ate a until-esima)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
     def do_GET(self):
-        """APIs publicas simuladas (Open-Meteo e BrasilAPI) para ambientes sem internet."""
+        """APIs publicas simuladas (Open-Meteo e BrasilAPI) para ambientes sem internet, e um endpoint instavel para testar novas tentativas."""
         if self.path.startswith("/fake/weather"):
             payload = {"latitude": -23.55, "longitude": -46.63,
                        "current": {"time": time.strftime("%Y-%m-%dT%H:%M"), "temperature_2m": 24.3,
@@ -423,6 +427,13 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/fake/cep/"):
             payload = {"cep": self.path.rsplit("/", 1)[-1], "state": "SP", "city": "Sao Paulo",
                        "neighborhood": "Bela Vista", "street": "Avenida Paulista", "service": "fake"}
+        elif self.path.startswith("/fake/flaky"):
+            query = parse_qs(urlparse(self.path).query)
+            key, until = query.get("key", [""])[0], int(query.get("until", ["1"])[0])
+            FLAKY_CALLS[key] = FLAKY_CALLS.get(key, 0) + 1
+            if FLAKY_CALLS[key] < until:
+                self.send_response(503); self.end_headers(); return
+            payload = {"key": key, "call": FLAKY_CALLS[key], "status": "ok"}
         elif self.path.startswith("/fake/search"):
             payload = {"results": [
                 {"title": "The definitive guide to Durable Execution | Temporal",

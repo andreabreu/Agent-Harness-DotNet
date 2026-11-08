@@ -111,6 +111,22 @@ Sem violacoes.
 - **US1 (D4)**: os ids estaveis do no `tool` sao um Guid derivado de `execucao/no/tentativa` (run) e
   `wf_<no>_<tentativa>` (chamada); a chamada da retomada usa os argumentos renderizados de novo (deterministicos),
   nao os do evento `tool_call`.
-- **Teste antes (Principio IV)**: os testes de unidade (T006) vieram antes do codigo; o script de queda (T007) e o
-  cenario (T008, T015) foram escritos logo depois da implementacao do motor, entao nao houve a execucao "falhando"
-  registrada para eles.
+- **US3 (T019)**: nao ha `CompleteOptionalFailure` no escalonador; o motor grava o no opcional como `failed` e o
+  entrega ao escalonador como concluido (`Complete`), o que ja mantem as arestas ativas. Retomada: um no opcional
+  `failed` e restaurado como concluido.
+- **US3 (D6)**: o no `tool` cancelado (prazo ou cancelamento) devolve falha em vez de propagar a excecao, com o
+  pseudo-run `cancelled`; `RunToolAsync` passa a dizer se a chamada comecou e se a ferramenta tem efeito
+  (`ToolNodeRun`), que a `NodeRetryPolicy` usa.
+- **US4 (D8/D10)**: `IWorkflowRecovery` ganhou `CancelRunning(id)` (NOTIFY no canal de cancelamento). Cancelamento e
+  prazo total nao disparam compensacao; so a falha do workflow. A retomada no meio de uma compensacao e detectada
+  pelo evento `compensation_started`.
+- **Estrutura**: o motor virou classe parcial em tres arquivos (`WorkflowEngine.cs` laco e fim,
+  `WorkflowEngine.Nodes.cs` nos e tentativas, `WorkflowEngine.Recovery.cs` reivindicacao, orfas e cancelamento) e
+  ganhou `CompensationPlan.cs` (puro, com testes).
+- **Teste antes (Principio IV)**: testes de unidade (T006, T018–T020, T027) vieram antes do codigo e falharam
+  primeiro (compilacao). O script de queda (T007) e o cenario de US1/US2 (T008, T015) foram escritos logo depois do
+  motor; as checagens de US3/US4 (T022, T028) foram escritas antes da reescrita do motor, mas so rodaram depois dela.
+  Nao ha registro de execucao "falhando" desses testes de ponta a ponta.
+
+Re-check final do Constitution Check: OK (Principio II reforcado: retry de ferramenta com efeito so antes de
+`tool_call_started`; Principio III: modo e regras da execucao valem na retomada pelo despachante).

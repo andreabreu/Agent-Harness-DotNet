@@ -6,6 +6,9 @@ using AgentPoc.Tools;
 
 namespace AgentPoc.Harness;
 
+/// <summary>Resultado de um no de ferramenta: se a chamada chegou a comecar e se a ferramenta tem efeito colateral.</summary>
+public sealed record ToolNodeRun(bool Ok, string Output, Guid RunId, bool EffectStarted, bool SideEffect);
+
 /// <summary>
 /// O harness: carrega a configuracao do agente do banco e roda o loop
 /// modelo -> tool calls -> resultados -> modelo, ate concluir ou bater um limite.
@@ -441,22 +444,24 @@ public sealed class AgentRunner
     /// Executa uma unica ferramenta fora de um agente (no de workflow), com a mesma politica e auditoria. O run e a
     /// chamada tem ids estaveis por tentativa do no: na retomada, um resultado ja gravado e devolvido e uma chamada
     /// interrompida segue <see cref="ToolExecutor.ExecutePendingAsync"/> (com efeito colateral, nao repete sozinha).
+    /// Cancelada (prazo ou cancelamento do workflow), o run termina cancelled e o resultado volta como falha.
     /// </summary>
-    public async Task<(bool Ok, string Output, Guid RunId)> RunToolAsync(string toolName, JsonObject args, Guid workflowRunId, string workflowNodeId,
-                                                                          int attempt, IHumanGate human, WorkflowToolRules? rules, CancellationToken ct)
+    public async Task<ToolNodeRun> RunToolAsync(string toolName, JsonObject args, Guid workflowRunId, string workflowNodeId,
+                                                int attempt, IHumanGate human, WorkflowToolRules? rules, CancellationToken ct)
     {
         var runId = StableId($"{workflowRunId}/{workflowNodeId}/{attempt}");
         var call = new ToolCall($"wf_{workflowNodeId}_{attempt}", toolName, args.ToJsonString());
         var agentId = "workflow:" + toolName;
         var input = $"{toolName}({args.ToJsonString(Text.RelaxedJson)})";
         var tools = await _registry.LoadAsync(new[] { toolName });
-        if (!tools.ContainsKey(toolName)) return (false, $"ERRO: ferramenta '{toolName}' nao existe.", runId);
+        if (!tools.ContainsKey(toolName)) return new ToolNodeRun(false, $"ERRO: ferramenta '{toolName}' nao existe.", runId, false, false);
 
         var existing = await _db.QueryOneAsync(
             "select status, output, (select coalesce(max(seq), 0) from run_events where run_id = @id) as last_seq from runs where id = @id",
             ("id", runId));
         if (existing != null && existing.S("status") != RunStatus.Running)
-            return (existing.S("status") == RunStatus.Completed, existing.S("output"), runId);
+            return new ToolNodeRun(existing.S("status") == RunStatus.Completed, existing.S("output"), runId,
+                await _events.ToolCallStartedAsync(runId, call.Id), tools[toolName].SideEffect);
 
         var ctx = new RunContext
         {
@@ -475,29 +480,38 @@ public sealed class AgentRunner
         };
         ctx.ActiveTools[toolName] = tools[toolName];
 
-        string output;
         if (existing == null)
         {
             await _db.ExecAsync(
                 @"insert into runs (id, root_run_id, workflow_run_id, workflow_node_id, agent_id, input, depth) values (@id, @id, @wf, @n, @a, @i, 0)",
                 ("id", runId), ("wf", workflowRunId), ("n", workflowNodeId), ("a", agentId), ("i", input));
             await _events.AddAsync(ctx, "run_started", new JsonObject { ["agent"] = agentId, ["depth"] = 0, ["input"] = input });
-            output = await _executor.ExecuteAsync(ctx, call, ct);
         }
-        else if (await RecordedToolOutputAsync(runId) is { } recorded)
-            output = recorded;
-        else
+        string output;
+        var cancelled = false;
+        try
         {
-            await _events.AddAsync(ctx, "run_resumed", new JsonObject { ["by"] = InstanceId });
-            output = await _executor.ExecutePendingAsync(ctx, call, ct);
+            if (existing == null) output = await _executor.ExecuteAsync(ctx, call, ct);
+            else if (await RecordedToolOutputAsync(runId) is { } recorded) output = recorded;
+            else
+            {
+                await _events.AddAsync(ctx, "run_resumed", new JsonObject { ["by"] = InstanceId });
+                output = await _executor.ExecutePendingAsync(ctx, call, ct);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            cancelled = true;
+            output = "CANCELADO: a ferramenta foi interrompida (prazo do no ou cancelamento do workflow).";
+            await _events.AddAsync(ctx, "cancelled", new JsonObject { ["tool"] = toolName });
         }
 
-        var ok = IsToolSuccess(output);
-        var status = ok ? RunStatus.Completed : RunStatus.Failed;
+        var ok = !cancelled && IsToolSuccess(output);
+        var status = ok ? RunStatus.Completed : cancelled ? RunStatus.Cancelled : RunStatus.Failed;
         await _db.ExecAsync("update runs set status = @s, output = @o, steps = 1, finished_at = now() where id = @id",
             ("s", status), ("o", output), ("id", runId));
         await _events.AddAsync(ctx, "run_finished", new JsonObject { ["status"] = status, ["output"] = Text.Trunc(output, 4000) });
-        return (ok, output, runId);
+        return new ToolNodeRun(ok, output, runId, await _events.ToolCallStartedAsync(runId, call.Id), tools[toolName].SideEffect);
     }
 
     /// <summary>Resultado da ferramenta ja gravado (queda entre o tool_result e o fim do run).</summary>
