@@ -1,5 +1,6 @@
 using AgentPoc.Core;
 using AgentPoc.Harness;
+using AgentPoc.Workflows;
 
 namespace AgentPoc.Queue;
 
@@ -11,11 +12,13 @@ public sealed class Worker
 {
     private readonly Db _db;
     private readonly AgentRunner _runner;
+    private readonly WorkflowEngine _workflows;
 
-    public Worker(Db db, AgentRunner runner)
+    public Worker(Db db, AgentRunner runner, WorkflowEngine workflows)
     {
         _db = db;
         _runner = runner;
+        _workflows = workflows;
     }
 
     public async Task<int> RecoverStaleAsync()
@@ -62,7 +65,7 @@ public sealed class Worker
                where id = (select id from tasks where status = 'queued'
                             order by priority desc, created_at
                             limit 1 for update skip locked)
-           returning id, agent_id, input, attempts, max_attempts", ("w", worker));
+           returning id, agent_id, input, attempts, max_attempts, workflow_run_id", ("w", worker));
 
     private async Task ProcessAsync(Dictionary<string, object?> task, string worker, CancellationToken ct)
     {
@@ -86,7 +89,9 @@ public sealed class Worker
 
         try
         {
-            var result = await _runner.RunAsync(agent, task.S("input"), ct: ct);
+            var workflowRun = task.GN("workflow_run_id");
+            var hooks = workflowRun is { } wf ? await _workflows.HooksForRunAsync(wf) : null;
+            var result = await _runner.RunAsync(agent, task.S("input"), workflowRunId: workflowRun, hooks: hooks, ct: ct);
             if (result.Status == "completed")
             {
                 await _db.ExecAsync(

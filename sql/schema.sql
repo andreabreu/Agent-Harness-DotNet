@@ -206,6 +206,8 @@ alter table workflow_runs add column if not exists approval_mode_explicit boolea
 alter table workflow_runs drop constraint if exists workflow_runs_approval_mode_check;
 alter table workflow_runs add constraint workflow_runs_approval_mode_check
     check (approval_mode in ('deny', 'auto', 'ask'));
+-- tarefa criada dentro de um workflow: o worker aplica o modo de aprovacao e as regras daquela execucao
+alter table tasks add column if not exists workflow_run_id uuid references workflow_runs(id);
 
 create table if not exists workflow_node_runs (
     workflow_run_id uuid not null references workflow_runs(id),

@@ -64,7 +64,7 @@ public sealed class App : IAsyncDisposable
         Runner = new AgentRunner(Db, Config, Registry, Executor, Events, runMessages, Chain, Lease, InstanceId);
         Builtins.Runner = Runner;
         Workflows = new WorkflowEngine(Db, Runner);
-        Worker = new Worker(Db, Runner);
+        Worker = new Worker(Db, Runner, Workflows);
         Evidence = new EvidenceWriter(Db);
         var human = new HumanInputStore(Db);
         HumanGate = new DurableHumanGate(human, Events, HumanRequestExpiry);

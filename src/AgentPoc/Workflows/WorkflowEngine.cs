@@ -176,10 +176,25 @@ public sealed class WorkflowEngine
                 $"Workflow '{workflowId}' nao iniciado: regras de ferramenta sem correspondencia no registro: {string.Join(", ", unmatched)}.");
     }
 
+    /// <summary>
+    /// Modo de aprovacao e regras de ferramenta de uma execucao, para trabalho que ela disparou fora do motor
+    /// (tarefas da fila criadas por agentes dos nos).
+    /// </summary>
+    public async Task<RunHooks> HooksForRunAsync(Guid wfRunId)
+    {
+        var run = await _db.QueryOneAsync("select workflow_id, approval_mode, approval_mode_explicit from workflow_runs where id = @id", ("id", wfRunId))
+                  ?? throw new InvalidOperationException($"workflow run {wfRunId} nao encontrado.");
+        var definition = await LoadDefinitionAsync(run.S("workflow_id"));
+        return new RunHooks(null, StoredApproval(run).Gate(), WorkflowToolRules.Parse(definition));
+    }
+
+    private static WorkflowApprovalMode StoredApproval(Dictionary<string, object?> run) =>
+        run.SN("approval_mode") is { } mode ? new WorkflowApprovalMode(mode, run.B("approval_mode_explicit")) : WorkflowApprovalMode.Default;
+
     /// <summary>Retomada mantem o modo gravado; um modo explicito novo substitui e fica registrado.</summary>
     private async Task<WorkflowApprovalMode> ResumedApprovalAsync(Guid wfRunId, Dictionary<string, object?> run, WorkflowApprovalMode? requested)
     {
-        var stored = run.SN("approval_mode") is { } mode ? new WorkflowApprovalMode(mode, run.B("approval_mode_explicit")) : WorkflowApprovalMode.Default;
+        var stored = StoredApproval(run);
         if (requested is not { Explicit: true } || requested == stored) return stored;
         await _db.ExecAsync("update workflow_runs set approval_mode = @mode, approval_mode_explicit = true where id = @id",
             ("mode", requested.Mode), ("id", wfRunId));

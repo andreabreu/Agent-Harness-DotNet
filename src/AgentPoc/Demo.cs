@@ -644,6 +644,8 @@ public static class Demo
     }
 
     private const string ShellToolNode = """{"type": "tool", "tool": "run_shell", "args": {"command": "echo aprovado"}, "next": []}""";
+    private const string QueueToCoderNode =
+        """{"type": "agent", "agent": "orchestrator", "input": "Use create_task: (a) para coder: rode ls -la no shell e apague o arquivo nada.txt", "next": []}""";
     private const string DelegateToCoderNode = """{"type": "agent", "agent": "orchestrator", "input": "delegue ao coder: rode ls -la no shell", "next": []}""";
 
     private sealed record WorkflowPolicyEvent(string Agent, string Tool, string Decision, string Source);
@@ -685,6 +687,8 @@ public static class Demo
         Approval.Mode = "auto";
         s.Notes.Add("O modo global da CLI fica em 'auto' de proposito: os workflows nao podem herda-lo.");
         WorkflowApprovalRun? byDefault = null, explicitAuto = null, delegated = null, allowed = null, blocked = null, denyWhen = null, inherited = null;
+        List<WorkflowPolicyEvent> queuedTaskPolicy = new();
+        long queuedTaskShellStarts = -1;
         Dictionary<string, object?>? storedMode = null;
         string? invalidRulesError = null;
         long invalidRulesRuns = -1;
@@ -706,6 +710,9 @@ public static class Demo
         s.Checks.Add(new Check("Subagente herdou a regra 'allow' (run_shell executou) e delete_file seguiu bloqueado pela politica global",
             _ => inherited != null && inherited.Has("run_shell", "approved", PolicySource.WorkflowAllow, agent: "coder") &&
                  inherited.Has("delete_file", "blocked", PolicySource.ToolPolicy, agent: "coder") && inherited.ShellStarts == 1));
+        s.Checks.Add(new Check("Tarefa da fila criada por um agente de workflow herdou o padrao: run_shell negado no worker, mesmo com o modo global em auto",
+            _ => queuedTaskPolicy.Any(p => p.Agent == "coder" && p.Tool == "run_shell" && p.Decision == "denied" && p.Source == PolicySource.ModeDefault) &&
+                 queuedTaskShellStarts == 0));
         s.Checks.Add(new Check("Regra com ferramenta inexistente impediu o inicio e a mensagem cita o padrao",
             _ => invalidRulesError?.Contains("ferramenta_inexistente") == true && invalidRulesRuns == 0));
 
@@ -732,6 +739,23 @@ public static class Demo
             Log.Write(0, ConsoleColor.Cyan, "demo_aprovacao_invalido", ex.Message);
         }
         invalidRulesRuns = Convert.ToInt64(await app.Db.ScalarAsync("select count(*) from workflow_runs where workflow_id = 'demo_aprovacao_invalido'"));
+
+        var queued = await RunApprovalWorkflowAsync(app, s, "demo_aprovacao_fila", QueueToCoderNode, null, ct);
+        await app.Worker.RunAsync(1, untilEmpty: true, ct);
+        var taskRun = (Guid?)await app.Db.ScalarAsync(
+            @"select t.result_run_id from tasks t join runs creator on creator.id = t.created_by_run
+               where creator.workflow_run_id = @w order by t.created_at desc limit 1", ("w", queued.Id));
+        if (taskRun is { } runId)
+        {
+            s.RootRuns.Add(runId);
+            queuedTaskPolicy = (await app.Db.QueryAsync(
+                    @"select r.agent_id, e.data->>'tool' as tool, e.data->>'decision' as decision, coalesce(e.data->>'source', '') as source
+                        from run_events e join runs r on r.id = e.run_id where r.id = @r and e.type = 'policy' order by e.id", ("r", runId)))
+                .Select(r => new WorkflowPolicyEvent(r.S("agent_id"), r.S("tool"), r.S("decision"), r.S("source"))).ToList();
+            queuedTaskShellStarts = Convert.ToInt64(await app.Db.ScalarAsync(
+                "select count(*) from run_events where run_id = @r and type = 'tool_call_started' and data->>'name' = 'run_shell'", ("r", runId)));
+            Log.Write(0, ConsoleColor.Cyan, "demo_aprovacao_fila", $"tarefa: {string.Join(", ", queuedTaskPolicy.Select(p => $"{p.Agent}/{p.Tool}={p.Decision} ({p.Source})"))}");
+        }
     }
 
     private sealed class CountingObserver : IRunObserver

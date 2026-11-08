@@ -203,8 +203,8 @@ public sealed class BuiltinTools
         var task = Arg(args, "task");
         if (await ValidateTarget(agentId, ctx) is { } err) return err;
         var id = (Guid)(await _db.ScalarAsync(
-            "insert into tasks (agent_id, input, priority, created_by_run) values (@a, @i, @p, @r) returning id",
-            ("a", agentId), ("i", task), ("p", ArgInt(args, "priority", 0)), ("r", ctx.RunId)))!;
+            "insert into tasks (agent_id, input, priority, created_by_run, workflow_run_id) values (@a, @i, @p, @r, @wf) returning id",
+            ("a", agentId), ("i", task), ("p", ArgInt(args, "priority", 0)), ("r", ctx.RunId), ("wf", ctx.WorkflowRunId)))!;
         await _events.AddAsync(ctx, "task_created", new JsonObject { ["task_id"] = id.ToString(), ["agent"] = agentId, ["task"] = Text.Trunc(task, 800) });
         Log.Write(ctx.Depth, ConsoleColor.DarkYellow, "fila", $"tarefa {Text.Short(id)} criada para {agentId}");
         return $"Tarefa criada: {id} (agente {agentId}, status queued).";

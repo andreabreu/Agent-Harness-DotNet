@@ -36,6 +36,7 @@ Esperado (cada item e uma checagem do cenario):
 | `block: ["kb_search"]` (global `auto`) | bloqueado, `source = workflow_block` |
 | `allow: ["run_shell"]` com `sudo ls` | bloqueado, `source = deny_when` |
 | no `agent` (orquestrador) delegando `ls -la` ao coder, sem modo | o `run_shell` do subagente e negado (`mode_default`) |
+| no `agent` criando tarefa na fila para o coder, worker com modo global `auto` | o `run_shell` da tarefa e negado (`mode_default`) |
 | regra com padrao inexistente | workflow nao inicia, mensagem cita o padrao |
 
 ## 3. Regressao
@@ -50,7 +51,7 @@ Esperado: todos os cenarios anteriores e os dois scripts com `RESULTADO: OK`.
 | Medicao | Linha de base (T001, commit `c45febb`) | Depois da feature (T028) |
 |---|---|---|
 | Testes de unidade | 74 | 99 |
-| Cenarios / checagens | 12 / 77 | 13 / 86 |
+| Cenarios / checagens | 12 / 77 | 13 / 87 (com a correcao da fila) |
 | `tests/run_restart.sh` | OK | OK |
 | `tests/hitl_restart.sh` | OK | OK |
 
