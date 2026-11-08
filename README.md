@@ -380,12 +380,11 @@ e a Brave Search API. O primeiro `dotnet run -- check` com o `.env` preenchido c
   (`APPROVAL_MODE`, padrao `auto` no `serve`), exceto tarefas criadas dentro de um workflow, que usam o modo da
   execucao (padrao `deny`). Tarefas criadas pelo chat continuam no modo da CLI do worker.
 - O modo e as regras `tools.allow`/`tools.block` vem da execucao (copia da definicao), nao do run do agente;
-  quem retoma o run de um no e o motor, que os repassa. Quando um no puder esperar uma pessoa de forma duravel
-  (spec 004), o run retomado direto pelo despachante precisara recebe-los.
+  quem retoma o run de um no e o motor, que os repassa.
 - No `tool` com efeito interrompido por queda resolve como pular (registrado em `tool_call_recovered`), porque o
-  gate de workflow nao tem pessoa para responder; a pergunta duravel vem com a spec 004.
+  gate de workflow nao tem pessoa para responder (nos de workflow nao esperam pessoa).
 - A espera entre tentativas e em memoria: numa queda durante a espera, a retomada recomeca o no (a espera duravel
-  vem com o no `wait`, spec 006). Os nos prontos rodam em lotes, entao `max_parallel` limita cada lote.
+  ficou fora do escopo da POC). Os nos prontos rodam em lotes, entao `max_parallel` limita cada lote.
 - Compensacao so roda o no declarado em `compensate`; nao desfaz efeitos dos agentes por conta propria. Cancelamento
   e prazo total vencido nao compensam (so a falha do workflow). Com o dono vivo em outro processo, o cancelamento
   chega pelo heartbeat (ate `RUN_HEARTBEAT_SECONDS`) ou por NOTIFY quando o dono roda o despachante.
