@@ -61,6 +61,11 @@ public static class Demo
             "Sem ninguem para responder, um workflow nega as ferramentas que exigem aprovacao, inclusive nos subagentes; o modo " +
             "explicito continua possivel e fica registrado na execucao; cada decisao de politica grava a sua origem.",
             new ScenarioFn(WorkflowAprovacao)),
+        ("workflow_desvio", "Desvio condicional: classificacao estruturada, ramos pulados, joins e retomada do desvio",
+            "Um agente classifica o pedido com saida validada contra um schema (nova tentativa quando erra o formato); um no " +
+            "condition escolhe o ramo e os outros ficam pulados; a consolidacao junta so os ramos ativos; uma queda depois do " +
+            "desvio e retomada no mesmo ramo sem chamar o classificador de novo; entrada tipada, transform e end fecham o fluxo.",
+            new ScenarioFn(WorkflowDesvio)),
     };
 
     private static readonly TimeSpan DemoDispatcherSweep = TimeSpan.FromSeconds(1);
@@ -756,6 +761,149 @@ public static class Demo
                 "select count(*) from run_events where run_id = @r and type = 'tool_call_started' and data->>'name' = 'run_shell'", ("r", runId)));
             Log.Write(0, ConsoleColor.Cyan, "demo_aprovacao_fila", $"tarefa: {string.Join(", ", queuedTaskPolicy.Select(p => $"{p.Agent}/{p.Tool}={p.Decision} ({p.Source})"))}");
         }
+    }
+
+    private const string TriageWorkflow = """
+        {"input_schema": {"type": "object", "properties": {"texto": {"type": "string"}}, "required": ["texto"]},
+         "output": "{{consolidar}}",
+         "nodes": {
+           "classificar": {"type": "agent", "agent": "researcher", "input": "Classifique o pedido: {{input.texto}}",
+                           "output_schema": {"type": "object",
+                                             "properties": {"categoria": {"type": "string", "enum": ["juridico", "financeiro", "suporte"]},
+                                                            "urgente": {"type": "boolean"}},
+                                             "required": ["categoria", "urgente"]},
+                           "next": ["rotear"]},
+           "rotear": {"type": "condition",
+                      "cases": [{"when": {"path": "classificar.urgente", "eq": true}, "next": ["escalar"]},
+                                {"when": {"path": "classificar.categoria", "eq": "juridico"}, "next": ["juridico"]},
+                                {"when": {"path": "classificar.categoria", "eq": "financeiro"}, "next": ["recusar"]}],
+                      "default": ["suporte"]},
+           "escalar":  {"type": "tool", "tool": "kb_search", "args": {"query": "escalonamento {{input.texto}}"}, "next": ["consolidar"]},
+           "juridico": {"type": "tool", "tool": "kb_search", "args": {"query": "politica juridica"}, "next": ["consolidar"]},
+           "suporte":  {"type": "tool", "tool": "kb_search", "args": {"query": "suporte"}, "next": ["consolidar"]},
+           "recusar":  {"type": "end", "status": "failed", "output": "Pedido recusado: {{classificar.categoria}}"},
+           "consolidar": {"type": "transform", "join": "all_active",
+                          "output": {"categoria": "{{classificar.categoria}}", "urgente": "{{classificar.urgente}}", "ramo": "{{rotear.next[0]}}"}}
+         }}
+        """;
+
+    private const string JoinAnyWorkflow = """
+        {"nodes": {
+           "a": {"type": "tool", "tool": "kb_search", "args": {"query": "agentes"}, "next": ["c"]},
+           "b": {"type": "tool", "tool": "kb_search", "args": {"query": "workflow"}, "next": ["c"]},
+           "c": {"type": "tool", "tool": "kb_search", "args": {"query": "primeiro que chegar"}, "join": "any"}
+         }}
+        """;
+
+    private sealed record WorkflowRunSnapshot(WorkflowResult Result, Dictionary<string, (string Status, int Attempt)> Nodes, long ClassifierRuns)
+    {
+        public string StatusOf(string node) => Nodes.TryGetValue(node, out var n) ? n.Status : "";
+        public bool Only(string executed, params string[] skipped) =>
+            StatusOf(executed) == "completed" && skipped.All(n => StatusOf(n) == "skipped");
+    }
+
+    private static async Task<WorkflowRunSnapshot> SnapshotAsync(App app, WorkflowResult result)
+    {
+        var nodes = (await app.Db.QueryAsync("select node_id, status, attempt from workflow_node_runs where workflow_run_id = @w", ("w", result.WorkflowRunId)))
+            .ToDictionary(r => r.S("node_id"), r => (r.S("status"), r.I("attempt")));
+        var classifierRuns = Convert.ToInt64(await app.Db.ScalarAsync(
+            "select count(*) from runs where workflow_run_id = @w and agent_id = 'researcher'", ("w", result.WorkflowRunId)));
+        Log.Write(0, ConsoleColor.Cyan, "triagem", $"{result.Status}: {string.Join(", ", nodes.Select(n => $"{n.Key}={n.Value.Item1}"))} | saida: {Text.Trunc(result.Output, 120)}");
+        return new WorkflowRunSnapshot(result, nodes, classifierRuns);
+    }
+
+    private static async Task<WorkflowRunSnapshot> RunTriageAsync(App app, EvidenceSession s, string text, CancellationToken ct)
+    {
+        var input = new System.Text.Json.Nodes.JsonObject { ["texto"] = text }.ToJsonString();
+        var result = await app.Workflows.RunAsync("demo_triagem", input, ct: ct);
+        s.WorkflowRuns.Add(result.WorkflowRunId);
+        return await SnapshotAsync(app, result);
+    }
+
+    private static async Task<string?> StartErrorAsync(Func<Task> start)
+    {
+        try
+        {
+            await start();
+            return null;
+        }
+        catch (InvalidOperationException ex)
+        {
+            Log.Write(0, ConsoleColor.Cyan, "rejeitado", ex.Message.Replace('\n', ' '));
+            return ex.Message;
+        }
+    }
+
+    private static async Task WorkflowDesvio(App app, EvidenceSession s, CancellationToken ct)
+    {
+        Approval.Mode = "auto";
+        WorkflowRunSnapshot? juridico = null, byDefault = null, urgent = null, retried = null, broken = null, resumed = null, joinAny = null, refused = null;
+        string? invalidInput = null, invalidDefinition = null;
+        long runsBeforeInvalidInput = -1, runsAfterInvalidInput = -2;
+        List<string> reusedAfterCrash = new();
+
+        s.Checks.Add(new Check("Pedido sobre contrato seguiu so o ramo juridico; escalar, suporte e recusar ficaram pulados",
+            _ => juridico?.Only("juridico", "escalar", "suporte", "recusar") == true));
+        s.Checks.Add(new Check("Pedido sem categoria conhecida seguiu o ramo default (suporte)",
+            _ => byDefault?.Only("suporte", "juridico", "escalar", "recusar") == true));
+        s.Checks.Add(new Check("Pedido urgente sobre contrato seguiu o primeiro caso verdadeiro (escalar), nao o juridico",
+            _ => urgent?.Only("escalar", "juridico", "suporte", "recusar") == true));
+        s.Checks.Add(new Check("Resposta fora do formato gerou nova tentativa com os erros e o workflow seguiu (2 runs do classificador)",
+            _ => retried is { ClassifierRuns: 2, Result.Status: "completed" }));
+        s.Checks.Add(new Check("Resposta sempre fora do formato: classificar falhou com os erros do schema apos 3 tentativas",
+            _ => broken is { ClassifierRuns: 3, Result.Status: "failed" } && broken.StatusOf("classificar") == "failed" &&
+                 broken.Result.Output.Contains("output_schema")));
+        s.Checks.Add(new Check("Queda depois do desvio: a retomada seguiu o mesmo ramo sem chamar o classificador de novo",
+            _ => resumed != null && resumed.Only("juridico", "escalar", "suporte", "recusar") && resumed.ClassifierRuns == 1 &&
+                 reusedAfterCrash.Contains("classificar") && reusedAfterCrash.Contains("rotear")));
+        s.Checks.Add(new Check("Join all_active: consolidar rodou uma vez, depois do ramo escolhido, com os outros pulados",
+            _ => juridico?.Nodes.GetValueOrDefault("consolidar") == ("completed", 1)));
+        s.Checks.Add(new Check("Join any: o no com dois antecessores em paralelo rodou uma unica vez",
+            _ => joinAny?.Nodes.GetValueOrDefault("c") == ("completed", 1) && joinAny.StatusOf("a") == "completed" && joinAny.StatusOf("b") == "completed"));
+        s.Checks.Add(new Check("Entrada fora do input_schema nao iniciou o workflow e citou o campo",
+            _ => invalidInput?.Contains("$.texto") == true && runsBeforeInvalidInput == runsAfterInvalidInput));
+        s.Checks.Add(new Check("transform montou JSON com tipos preservados e virou a saida final do workflow",
+            _ => juridico != null && System.Text.Json.Nodes.JsonNode.Parse(juridico.Result.Output) is System.Text.Json.Nodes.JsonObject o &&
+                 o["categoria"]?.GetValue<string>() == "juridico" && o["urgente"]?.GetValueKind() == System.Text.Json.JsonValueKind.False &&
+                 o["ramo"]?.GetValue<string>() == "juridico"));
+        s.Checks.Add(new Check("Pedido de fatura chegou ao end com falha: workflow failed com a mensagem renderizada",
+            _ => refused is { Result.Status: "failed", Result.Output: "Pedido recusado: financeiro" } && refused.StatusOf("consolidar") == "skipped"));
+        s.Checks.Add(new Check("Definicao com destino inexistente nao iniciou e o erro cita o caminho",
+            _ => invalidDefinition?.Contains("rotear.cases[0].next: destino 'juridco' nao existe") == true));
+
+        await SaveDemoWorkflowAsync(app, "demo_triagem", TriageWorkflow);
+        juridico = await RunTriageAsync(app, s, "revisar o contrato de locacao", ct);
+        byDefault = await RunTriageAsync(app, s, "duvida geral sobre o sistema", ct);
+        urgent = await RunTriageAsync(app, s, "contrato urgente para assinar hoje", ct);
+        retried = await RunTriageAsync(app, s, "revisar contrato (formato quebrado)", ct);
+        broken = await RunTriageAsync(app, s, "pedido sempre quebrado", ct);
+        refused = await RunTriageAsync(app, s, "pagar fatura atrasada", ct);
+
+        try
+        {
+            await app.Workflows.RunAsync("demo_triagem", """{"texto": "revisar o contrato de aluguel"}""", crashAfter: "rotear", ct: ct);
+        }
+        catch (SimulatedCrashException ex)
+        {
+            s.WorkflowRuns.Add(ex.WorkflowRunId);
+            Log.Warn(ex.Message);
+            var result = await app.Workflows.RunAsync("demo_triagem", null, resumeRunId: ex.WorkflowRunId, ct: ct);
+            reusedAfterCrash = result.ReusedNodes;
+            resumed = await SnapshotAsync(app, result);
+        }
+
+        await SaveDemoWorkflowAsync(app, "demo_join_any", JoinAnyWorkflow);
+        var any = await app.Workflows.RunAsync("demo_join_any", "", ct: ct);
+        s.WorkflowRuns.Add(any.WorkflowRunId);
+        joinAny = await SnapshotAsync(app, any);
+
+        const string countTriageRuns = "select count(*) from workflow_runs where workflow_id = 'demo_triagem'";
+        runsBeforeInvalidInput = Convert.ToInt64(await app.Db.ScalarAsync(countTriageRuns));
+        invalidInput = await StartErrorAsync(() => app.Workflows.RunAsync("demo_triagem", """{"assunto": "x"}""", ct: ct));
+        runsAfterInvalidInput = Convert.ToInt64(await app.Db.ScalarAsync(countTriageRuns));
+
+        await SaveDemoWorkflowAsync(app, "demo_triagem_invalida", TriageWorkflow.Replace("\"next\": [\"escalar\"]", "\"next\": [\"juridco\"]"));
+        invalidDefinition = await StartErrorAsync(() => app.Workflows.RunAsync("demo_triagem_invalida", """{"texto": "x"}""", ct: ct));
     }
 
     private sealed class CountingObserver : IRunObserver

@@ -220,6 +220,10 @@ create table if not exists workflow_node_runs (
     finished_at     timestamptz,
     primary key (workflow_run_id, node_id)
 );
+alter table workflow_node_runs drop constraint if exists workflow_node_runs_status_check;
+alter table workflow_node_runs add constraint workflow_node_runs_status_check
+    check (status in ('running', 'completed', 'failed', 'skipped'));
+alter table workflow_node_runs add column if not exists chosen_next text[];  -- desvio concluido: destinos escolhidos
 
 -- ---------------- chat ----------------
 

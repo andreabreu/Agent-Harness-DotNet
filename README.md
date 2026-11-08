@@ -165,6 +165,7 @@ Opcoes: `--approval auto|deny|ask`, `--budget <tokens>`.
 | `hitl_cancela` | Cancelar o raiz com subagente suspenso: toda a cadeia `cancelled`, pedido fechado, nada retomado |
 | `durabilidade_entrega` | Queda injetada (`AGENTPOC_FAULT`) dentro da transacao que conclui o filho e acorda o pai: nada fica pela metade, o lease vence, o filho e recuperado sem chamar o modelo de novo e o pai termina com um unico `tool_result`; pai preso forjado no banco e corrigido pela reconciliacao |
 | `workflow_aprovacao` | Workflow sem modo informado nega `run_shell` (no de ferramenta e subagente), modo `auto` explicito executa, `tools.allow` libera, `tools.block` bloqueia ferramenta `auto`, `deny_when` vence o `allow`, tarefa da fila criada no workflow herda o padrao no worker, regra com ferramenta inexistente impede o inicio; cada decisao grava a origem |
+| `workflow_desvio` | Triagem: classificador com `output_schema` (nova tentativa quando erra o formato), desvio com 3 casos e `default`, ramos pulados, join `all_active`, join `any`, `transform` com tipos preservados, `end` com falha, entrada fora do `input_schema` e definicao invalida rejeitadas, queda depois do desvio retomada sem reclassificar |
 | `chat` | Conversa de 5 turnos: pesquisa na web, plano + delegacao, resposta pelo historico, aprovacao negada, ferramentas persistidas, streaming e compactacao em resumo |
 
 ## Como funciona
@@ -186,7 +187,7 @@ src/AgentPoc/
   Chat/                     conversa: persistencia, turno, compactacao, CLI
   Web/                      API REST + SSE, aprovacao pela tela; pagina em wwwroot/index.html
   Tools/WebSearch.cs        busca na web (SearXNG, Brave ou DuckDuckGo Lite)
-  Workflows/                motor de grafo com paralelismo, checkpoint e retomada
+  Workflows/                motor de grafo (definicao validada, escalonador, condicoes, schema, valores)
   Queue/Worker.cs           fila com claim atomico, heartbeat e retentativa
   Evidence/                 relatorios de evidencia a partir do banco
 sql/schema.sql, seed.sql    tudo que define comportamento
@@ -211,6 +212,22 @@ sql/schema.sql, seed.sql    tudo que define comportamento
   `deny_when` > `block` > `approval_when` > `allow` > politica da ferramenta; `allow` so dispensa a politica
   `approval`. Padrao sem ferramenta correspondente impede o inicio. Tarefa criada na fila por um agente do
   workflow (`create_task`) guarda `tasks.workflow_run_id`, e o worker aplica o modo e as regras daquela execucao.
+- **Nos de workflow**: `agent`, `tool`, `condition` (desvio), `transform` (monta JSON sem modelo) e `end` (termina
+  com `completed` ou `failed`). A definicao e validada antes de iniciar e todos os erros voltam juntos
+  (`rotear.cases[0].next: destino 'juridco' nao existe`).
+  - *Desvio*: `cases` em ordem (o primeiro verdadeiro vence) e `default`. Condicoes sao JSON, sem codigo:
+    `{"path": "classificar.urgente", "eq": true}`, operadores `eq ne gt gte lt lte contains in exists`,
+    combinaveis com `all`, `any` e `not`; tipos estritos e caminho ausente da falso.
+  - *Saida estruturada*: um no `agent` com `output_schema` (subconjunto de JSON Schema: `type`, `properties`,
+    `required`, `enum`, `items`) recebe o formato no prompt; a resposta e validada e, se errada, o agente roda de
+    novo com os erros (`output_retries`, padrao 2).
+  - *Campos*: `{{no.campo}}`, `{{no.lista[0]}}`, `{{input.campo}}`; uma string que e so uma referencia preserva o
+    tipo (numero, booleano, lista). Referencia a no inexistente e erro de definicao; a campo inexistente, falha do no.
+  - *Pulados e joins*: ramos nao escolhidos ficam `skipped` (e quem so depende deles tambem). `join`: `all`
+    (padrao, todos os antecessores), `all_active` (os que nao foram pulados) ou `any` (o primeiro).
+  - *Retomada*: o desvio escolhido fica em `workflow_node_runs.chosen_next`; o `--resume` rele a escolha e os
+    pulados, sem chamar o classificador de novo.
+  - *Entrada e saida*: `input_schema` valida a entrada (JSON) antes de iniciar; `output` define a saida final.
 - **Suspensao duravel**: um run pode parar sem processo preso (`waiting_human`, `waiting_child`), com todo o
   historico no banco. Qualquer instancia com o despachante retoma o mesmo run quando ele fica `ready`.
   Estados: `running` -> `waiting_human` | `waiting_child` -> `ready` -> `running` -> `completed`/... ;
@@ -296,6 +313,10 @@ com o modo global da CLI em `auto` de proposito); `tests/run_restart.sh` e `test
 `workflow` na linha de comando sem modo (nega), com `--approval auto` (executa) e com `APPROVAL_MODE` invalido
 (erro, codigo 1). Testes unitarios: 99.
 
+Com desvio condicional (spec 002): 14 cenarios, 99/99 checagens (inclui `workflow_desvio`, 12/12);
+`tests/run_restart.sh` e `tests/hitl_restart.sh` OK; `workflow`, `retomada` e `workflow_aprovacao` iguais com o motor
+refeito em volta do escalonador. Testes unitarios: 166.
+
 Nao testado: contra o Azure Foundry real (inclusive `stream_options` e `reasoning_effort` no deployment)
 e a Brave Search API. O primeiro `dotnet run -- check` com o `.env` preenchido confirma o modelo.
 
@@ -325,6 +346,9 @@ e a Brave Search API. O primeiro `dotnet run -- check` com o `.env` preenchido c
 - As regras `tools.allow`/`tools.block` vem da definicao atual do workflow, inclusive no `--resume` (a definicao
   nao e fixada por execucao); nem elas nem o modo sao gravados no run do agente. Quando um no puder esperar uma
   pessoa de forma duravel, o run retomado precisara recebe-los.
+- Condicoes nao tem aritmetica nem funcoes (so comparacoes e combinacoes); a saida estruturada vem do prompt e da
+  validacao local, sem o `response_format` do provedor; nos prontos rodam em lotes (um no `any` espera o lote
+  inteiro terminar, nao so o primeiro antecessor).
 - `tools.allow` nao supera `approval_when`: um `http_get` liberado para uma URL interna continua pedindo
   aprovacao (e e negado no modo padrao).
 - Sem autenticacao, nao ha registro de QUEM decidiu nem aprovador por papel/notificacao (Teams, e-mail).

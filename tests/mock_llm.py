@@ -154,8 +154,20 @@ def orchestrator(c):
             f"Custo estimado ({custo.group(0) if custo else 'ver arquivo'}, calculado por custo.py) e Clima atual de Sao Paulo.")
 
 
+def classify(t):
+    """Classificador de triagem: decide so pelo pedido (antes da instrucao de formato, que cita as categorias)."""
+    pedido = t.split("responda apenas")[0]
+    if "sempre quebrado" in pedido or ("formato quebrado" in pedido and "resposta anterior" not in t):
+        return "Acho que este pedido e do juridico."
+    categoria = "juridico" if "contrato" in pedido else "financeiro" if "fatura" in pedido else "suporte"
+    return json.dumps({"categoria": categoria, "urgente": "urgente" in pedido})
+
+
 def researcher(c):
     t = c.task.lower()
+    if "classifique" in t:
+        return classify(t)
+
     if "pergunte a pessoa" in t:
         if not c.called("ask_human"):
             return [call("ask_human", question="Qual ambiente devo usar no deploy?", options=["homologacao", "producao"])]

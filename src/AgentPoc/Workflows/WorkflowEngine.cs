@@ -1,8 +1,7 @@
+using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Text.RegularExpressions;
 using AgentPoc.Core;
 using AgentPoc.Harness;
-using AgentPoc.Tools;
 
 namespace AgentPoc.Workflows;
 
@@ -15,13 +14,14 @@ public sealed class SimulatedCrashException : Exception
 public sealed record WorkflowResult(Guid WorkflowRunId, string Status, string Output, List<string> ReusedNodes);
 
 /// <summary>
-/// Motor de workflow deterministico definido em JSON no banco.
-/// Nos 'agent' ou 'tool'; arestas em "next"; nos prontos rodam em paralelo;
-/// checkpoint por no em workflow_node_runs permite retomada apos queda.
+/// Motor de workflow deterministico definido em JSON no banco. Nos agent, tool, condition, transform e end; quem
+/// roda e quem e pulado vem do <see cref="WorkflowScheduler"/>; nos prontos rodam em paralelo; checkpoint por no em
+/// workflow_node_runs (inclusive o desvio escolhido) permite retomada apos queda.
 /// </summary>
 public sealed class WorkflowEngine
 {
-    private static readonly Regex Var = new(@"\{\{\s*([A-Za-z0-9_]+)\s*\}\}", RegexOptions.Compiled);
+    private const string RetryFeedback = "Sua resposta anterior nao seguiu o formato pedido. Corrija estes erros:";
+
     private readonly Db _db;
     private readonly AgentRunner _runner;
 
@@ -31,14 +31,18 @@ public sealed class WorkflowEngine
         _runner = runner;
     }
 
+    private sealed record NodeResult(string Node, bool Ok, string Output, Guid? RunId = null,
+                                     IReadOnlyList<string>? ChosenNext = null, string? EndStatus = null);
+
     /// <param name="approval">Modo de aprovacao da execucao; nulo nega (padrao) ou, na retomada, mantem o gravado.</param>
     public async Task<WorkflowResult> RunAsync(string workflowId, string? input, Guid? resumeRunId = null, string? crashAfter = null,
                                                WorkflowApprovalMode? approval = null, CancellationToken ct = default)
     {
         Guid wfRunId;
         string wfInput;
-        JsonObject definition;
-        var outputs = new Dictionary<string, string>(StringComparer.Ordinal);
+        JsonObject rawDefinition;
+        WorkflowDefinition definition;
+        var checkpoint = new List<Dictionary<string, object?>>();
         var reused = new List<string>();
 
         if (resumeRunId is Guid rid)
@@ -49,15 +53,14 @@ public sealed class WorkflowEngine
             workflowId = run.S("workflow_id");
             wfInput = run.S("input");
             wfRunId = rid;
+            rawDefinition = await LoadDefinitionAsync(workflowId);
+            definition = WorkflowDefinition.Parse(rawDefinition, workflowId);
             approval = await ResumedApprovalAsync(rid, run, approval);
-            definition = await LoadDefinitionAsync(workflowId);
-            foreach (var n in await _db.QueryAsync("select node_id, output from workflow_node_runs where workflow_run_id = @id and status = 'completed'", ("id", rid)))
-            {
-                outputs[n.S("node_id")] = n.S("output");
-                reused.Add(n.S("node_id"));
-            }
+            checkpoint = await _db.QueryAsync(
+                "select node_id, status, output, chosen_next from workflow_node_runs where workflow_run_id = @id and status in ('completed', 'skipped')",
+                ("id", rid));
             await _db.ExecAsync("update workflow_runs set status = 'running', finished_at = null where id = @id", ("id", rid));
-            Log.Info($"Retomando workflow '{workflowId}' run {Text.Short(rid)} (status anterior: {run.S("status")}). Nos reaproveitados do checkpoint: {(reused.Count == 0 ? "nenhum" : string.Join(", ", reused))}");
+            Log.Info($"Retomando workflow '{workflowId}' run {Text.Short(rid)} (status anterior: {run.S("status")}).");
         }
         else
         {
@@ -65,8 +68,10 @@ public sealed class WorkflowEngine
             approval ??= WorkflowApprovalMode.Default;
             var version = await _db.ScalarAsync("select version from workflows where id = @id and enabled", ("id", workflowId))
                           ?? throw new InvalidOperationException($"Workflow '{workflowId}' nao existe ou esta desabilitado.");
-            definition = await LoadDefinitionAsync(workflowId);
-            await EnsureToolRulesMatchRegisteredToolsAsync(workflowId, WorkflowToolRules.Parse(definition));
+            rawDefinition = await LoadDefinitionAsync(workflowId);
+            definition = WorkflowDefinition.Parse(rawDefinition, workflowId);
+            EnsureInputMatchesSchema(workflowId, definition, wfInput);
+            await EnsureToolRulesMatchRegisteredToolsAsync(workflowId, WorkflowToolRules.Parse(rawDefinition));
             wfRunId = (Guid)(await _db.ScalarAsync(
                 @"insert into workflow_runs (workflow_id, workflow_version, input, approval_mode, approval_mode_explicit)
                   values (@w, @v, @i, @mode, @explicit) returning id",
@@ -75,49 +80,49 @@ public sealed class WorkflowEngine
         }
         Log.Info($"aprovacao: {approval.Describe()}");
         var gate = approval.Gate();
-        var rules = WorkflowToolRules.Parse(definition);
+        var rules = WorkflowToolRules.Parse(rawDefinition);
 
-        var nodes = definition["nodes"] as JsonObject
-                    ?? throw new InvalidOperationException("Definicao de workflow invalida: falta 'nodes'.");
-
-        var preds = nodes.ToDictionary(kv => kv.Key, _ => new List<string>(), StringComparer.Ordinal);
-        foreach (var (id, node) in nodes)
-            if (node?["next"] is JsonArray next)
-                foreach (var n in next)
-                {
-                    var target = HttpTool.ArgString(n);
-                    if (!preds.ContainsKey(target)) throw new InvalidOperationException($"No '{id}' aponta para '{target}', que nao existe.");
-                    preds[target].Add(id);
-                }
-
-        var done = new HashSet<string>(outputs.Keys, StringComparer.Ordinal);
-        var pending = nodes.Select(kv => kv.Key).Where(k => !done.Contains(k)).ToList();
+        var values = new WorkflowValues(wfInput);
+        var scheduler = new WorkflowScheduler(definition);
+        RestoreCheckpoint(checkpoint, definition, scheduler, values, reused);
+        if (resumeRunId != null)
+            Log.Info($"Nos reaproveitados do checkpoint: {(reused.Count == 0 ? "nenhum" : string.Join(", ", reused))}");
 
         try
         {
-            while (pending.Count > 0)
+            while (true)
             {
-                var ready = pending.Where(n => preds[n].All(done.Contains)).ToList();
-                if (ready.Count == 0) throw new InvalidOperationException("Workflow sem progresso possivel (ciclo nas arestas?).");
-                Log.Write(0, ConsoleColor.Blue, "workflow", ready.Count > 1 ? $"executando em paralelo: {string.Join(" || ", ready)}" : $"executando no: {ready[0]}");
+                var step = scheduler.Next();
+                await SaveSkippedAsync(wfRunId, step.Skipped, values);
+                if (step.Ready.Count == 0)
+                {
+                    if (!scheduler.HasPending) break;
+                    throw new InvalidOperationException("Workflow sem progresso possivel (ciclo nas arestas?).");
+                }
+                Log.Write(0, ConsoleColor.Blue, "workflow",
+                    step.Ready.Count > 1 ? $"executando em paralelo: {string.Join(" || ", step.Ready)}" : $"executando no: {step.Ready[0]}");
 
-                var results = await Task.WhenAll(ready.Select(n => RunNodeAsync(wfRunId, n, (JsonObject)nodes[n]!, wfInput, outputs, gate, rules, ct)));
-                var failed = results.Where(x => !x.Ok).ToList();
+                var results = await Task.WhenAll(step.Ready.Select(n => RunNodeAsync(wfRunId, definition.Nodes[n], values, gate, rules, ct)));
                 foreach (var res in results.Where(x => x.Ok))
                 {
-                    outputs[res.Node] = res.Output;
-                    done.Add(res.Node);
-                    pending.Remove(res.Node);
+                    values.SetOutput(res.Node, res.Output);
+                    scheduler.Complete(res.Node, res.ChosenNext);
                 }
+                var failed = results.Where(x => !x.Ok).ToList();
                 if (failed.Count > 0)
                 {
                     var msg = string.Join("; ", failed.Select(f => $"{f.Node}: {Text.Trunc(f.Output, 300)}"));
-                    await _db.ExecAsync("update workflow_runs set status = 'failed', output = @o, finished_at = now() where id = @id", ("o", msg), ("id", wfRunId));
                     Log.Error($"Workflow falhou: {msg}");
-                    return new WorkflowResult(wfRunId, "failed", msg, reused);
+                    return await FinishAsync(wfRunId, workflowId, WorkflowRunStatus.Failed, msg, reused);
                 }
 
-                if (crashAfter != null && ready.Contains(crashAfter))
+                if (FirstEnd(results, definition) is { } end)
+                {
+                    await SaveSkippedAsync(wfRunId, scheduler.Finish(), values);
+                    return await FinishAsync(wfRunId, workflowId, end.EndStatus!, end.Output, reused);
+                }
+
+                if (crashAfter != null && step.Ready.Contains(crashAfter))
                 {
                     await _db.ExecAsync("update workflow_runs set status = 'crashed' where id = @id", ("id", wfRunId));
                     throw new SimulatedCrashException(wfRunId, crashAfter);
@@ -134,30 +139,84 @@ public sealed class WorkflowEngine
             throw;
         }
 
-        var terminals = nodes.Where(kv => kv.Value?["next"] is not JsonArray a || a.Count == 0).Select(kv => kv.Key).ToList();
-        var final = string.Join("\n\n", terminals.Select(t => outputs.TryGetValue(t, out var o) ? o : ""));
-        await _db.ExecAsync("update workflow_runs set status = 'completed', output = @o, finished_at = now() where id = @id", ("o", final), ("id", wfRunId));
-        Log.Ok($"Workflow '{workflowId}' concluido (run {Text.Short(wfRunId)}).");
-        return new WorkflowResult(wfRunId, "completed", final, reused);
+        try
+        {
+            return await FinishAsync(wfRunId, workflowId, WorkflowRunStatus.Completed, FinalOutput(definition, scheduler, values), reused);
+        }
+        catch (WorkflowValueException ex)
+        {
+            return await FinishAsync(wfRunId, workflowId, WorkflowRunStatus.Failed, $"output: {ex.Message}", reused);
+        }
     }
 
-    private sealed record NodeResult(string Node, bool Ok, string Output);
-
-    private static string Render(string template, string input, IReadOnlyDictionary<string, string> outputs) =>
-        Var.Replace(template, m =>
-        {
-            var key = m.Groups[1].Value;
-            if (key == "input") return input;
-            return outputs.TryGetValue(key, out var v) ? v : "";
-        });
-
-    private static JsonNode? RenderNode(JsonNode? node, string input, IReadOnlyDictionary<string, string> outputs) => node switch
+    private static void RestoreCheckpoint(List<Dictionary<string, object?>> checkpoint, WorkflowDefinition definition,
+                                          WorkflowScheduler scheduler, WorkflowValues values, List<string> reused)
     {
-        JsonObject o => new JsonObject(o.Select(kv => new KeyValuePair<string, JsonNode?>(kv.Key, RenderNode(kv.Value, input, outputs)))),
-        JsonArray a => new JsonArray(a.Select(x => RenderNode(x, input, outputs)).ToArray()),
-        JsonValue v when v.TryGetValue<string>(out var s) => JsonValue.Create(Render(s, input, outputs)),
-        _ => node?.DeepClone()
-    };
+        foreach (var row in checkpoint.Where(r => definition.Nodes.ContainsKey(r.S("node_id"))))
+        {
+            var node = row.S("node_id");
+            if (row.S("status") == "skipped")
+            {
+                scheduler.Restore(node, NodeState.Skipped);
+                values.MarkSkipped(node);
+                continue;
+            }
+            scheduler.Restore(node, NodeState.Completed, row["chosen_next"] as string[]);
+            values.SetOutput(node, row.S("output"));
+            reused.Add(node);
+        }
+    }
+
+    /// <summary>Dois end no mesmo lote: failed vence; empate, o primeiro na ordem da definicao.</summary>
+    private static NodeResult? FirstEnd(NodeResult[] results, WorkflowDefinition definition) =>
+        results.Where(r => r.EndStatus != null)
+            .OrderBy(r => r.EndStatus == WorkflowRunStatus.Failed ? 0 : 1)
+            .ThenBy(r => definition.Ordered.ToList().FindIndex(n => n.Id == r.Node))
+            .FirstOrDefault();
+
+    /// <summary>Saida declarada em "output"; sem ela, as saidas dos nos finais que executaram.</summary>
+    private static string FinalOutput(WorkflowDefinition definition, WorkflowScheduler scheduler, WorkflowValues values)
+    {
+        if (definition.Output != null) return AsOutputText(values.RenderJson(definition.Output));
+        var terminals = definition.Ordered.Where(n => n.Next.Count == 0 && scheduler.StateOf(n.Id) == NodeState.Completed);
+        return string.Join("\n\n", terminals.Select(n => values.OutputOf(n.Id) ?? ""));
+    }
+
+    private static string AsOutputText(JsonNode? value) =>
+        value is JsonValue v && v.GetValueKind() == JsonValueKind.String ? v.GetValue<string>() : value?.ToJsonString() ?? "";
+
+    private async Task<WorkflowResult> FinishAsync(Guid wfRunId, string workflowId, string status, string output, List<string> reused)
+    {
+        await _db.ExecAsync("update workflow_runs set status = @s, output = @o, finished_at = now() where id = @id",
+            ("s", status), ("o", output), ("id", wfRunId));
+        if (status == WorkflowRunStatus.Completed) Log.Ok($"Workflow '{workflowId}' concluido (run {Text.Short(wfRunId)}).");
+        else Log.Error($"Workflow '{workflowId}' terminou como {status} (run {Text.Short(wfRunId)}): {Text.Trunc(output, 300)}");
+        return new WorkflowResult(wfRunId, status, output, reused);
+    }
+
+    private async Task SaveSkippedAsync(Guid wfRunId, IReadOnlyList<string> skipped, WorkflowValues values)
+    {
+        foreach (var node in skipped)
+        {
+            values.MarkSkipped(node);
+            await _db.ExecAsync(
+                @"insert into workflow_node_runs (workflow_run_id, node_id, status, finished_at) values (@w, @n, 'skipped', now())
+                  on conflict (workflow_run_id, node_id) do update set status = 'skipped', finished_at = now()",
+                ("w", wfRunId), ("n", node));
+            Log.Write(0, ConsoleColor.DarkGray, "workflow", $"no '{node}' pulado");
+        }
+    }
+
+    private static void EnsureInputMatchesSchema(string workflowId, WorkflowDefinition definition, string input)
+    {
+        if (definition.InputSchema == null) return;
+        JsonNode? parsed;
+        try { parsed = JsonNode.Parse(input); }
+        catch (JsonException) { parsed = null; }
+        var errors = parsed == null ? new List<string> { "$: a entrada deve ser um JSON" } : JsonSchemaLite.Validate(definition.InputSchema, parsed);
+        if (errors.Count > 0)
+            throw new InvalidOperationException($"Workflow '{workflowId}' nao iniciado: entrada fora do input_schema:\n{string.Join("\n", errors)}");
+    }
 
     private async Task<JsonObject> LoadDefinitionAsync(string workflowId)
     {
@@ -202,44 +261,93 @@ public sealed class WorkflowEngine
         return requested;
     }
 
-    private async Task<NodeResult> RunNodeAsync(Guid wfRunId, string nodeId, JsonObject node, string input, IReadOnlyDictionary<string, string> outputs,
-                                                IHumanGate gate, WorkflowToolRules? rules, CancellationToken ct)
+    private async Task<NodeResult> RunNodeAsync(Guid wfRunId, WorkflowNode node, WorkflowValues values, IHumanGate gate,
+                                                WorkflowToolRules? rules, CancellationToken ct)
     {
         await _db.ExecAsync(
             @"insert into workflow_node_runs (workflow_run_id, node_id, status) values (@w, @n, 'running')
               on conflict (workflow_run_id, node_id) do update
                  set status = 'running', attempt = workflow_node_runs.attempt + 1, started_at = now(), finished_at = null",
-            ("w", wfRunId), ("n", nodeId));
+            ("w", wfRunId), ("n", node.Id));
 
-        var type = HttpTool.ArgString(node["type"]);
-        bool ok;
-        string output;
-        Guid runId;
-        if (type == "agent")
+        NodeResult result;
+        try
         {
-            var prompt = Render(HttpTool.ArgString(node["input"]), input, outputs);
-            var r = await _runner.RunAsync(HttpTool.ArgString(node["agent"]), prompt, workflowRunId: wfRunId, hooks: new RunHooks(null, gate, rules), ct: ct);
-            ok = r.Status == "completed";
-            output = r.Output;
-            runId = r.RunId;
+            result = node.Type switch
+            {
+                WorkflowNodeType.Agent => await RunAgentNodeAsync(wfRunId, node, values, new RunHooks(null, gate, rules), ct),
+                WorkflowNodeType.Tool => await RunToolNodeAsync(wfRunId, node, values, gate, rules, ct),
+                WorkflowNodeType.Condition => RunCondition(node, values),
+                WorkflowNodeType.Transform => new NodeResult(node.Id, true, AsOutputText(values.RenderJson(node.Raw["output"]))),
+                _ => new NodeResult(node.Id, true, AsOutputText(values.RenderJson(node.Raw["output"])), EndStatus: node.Text("status"))
+            };
         }
-        else if (type == "tool")
+        catch (WorkflowValueException ex)
         {
-            var args = RenderNode(node["args"], input, outputs) as JsonObject ?? new JsonObject();
-            var r = await _runner.RunToolAsync(HttpTool.ArgString(node["tool"]), args, wfRunId, gate, rules, ct);
-            ok = r.Ok;
-            output = r.Output;
-            runId = r.RunId;
-        }
-        else
-        {
-            return new NodeResult(nodeId, false, $"tipo de no desconhecido: '{type}'");
+            result = new NodeResult(node.Id, false, $"ERRO: {ex.Message}");
         }
 
         await _db.ExecAsync(
-            "update workflow_node_runs set status = @s, output = @o, agent_run_id = @r, finished_at = now() where workflow_run_id = @w and node_id = @n",
-            ("s", ok ? "completed" : "failed"), ("o", output), ("r", runId), ("w", wfRunId), ("n", nodeId));
-        Log.Write(0, ok ? ConsoleColor.Green : ConsoleColor.Red, "workflow", $"no '{nodeId}' {(ok ? "concluido" : "falhou")} (checkpoint gravado)");
-        return new NodeResult(nodeId, ok, output);
+            @"update workflow_node_runs set status = @s, output = @o, agent_run_id = @r, chosen_next = @chosen, finished_at = now()
+               where workflow_run_id = @w and node_id = @n",
+            ("s", result.Ok ? WorkflowRunStatus.Completed : WorkflowRunStatus.Failed), ("o", result.Output), ("r", result.RunId),
+            ("chosen", result.ChosenNext?.ToArray()), ("w", wfRunId), ("n", node.Id));
+        Log.Write(0, result.Ok ? ConsoleColor.Green : ConsoleColor.Red, "workflow",
+            $"no '{node.Id}' {(result.Ok ? "concluido" : "falhou")} (checkpoint gravado)" +
+            (result.ChosenNext != null ? $" -> {(result.ChosenNext.Count == 0 ? "nenhum destino" : string.Join(", ", result.ChosenNext))}" : ""));
+        return result;
+    }
+
+    /// <summary>
+    /// Com output_schema, pede o JSON no prompt, valida a resposta e repete com os erros ate output_retries vezes;
+    /// a saida gravada e o JSON validado.
+    /// </summary>
+    private async Task<NodeResult> RunAgentNodeAsync(Guid wfRunId, WorkflowNode node, WorkflowValues values, RunHooks hooks, CancellationToken ct)
+    {
+        var prompt = values.RenderText(node.Text("input"));
+        var agent = node.Text("agent");
+        if (node.Raw["output_schema"] is not JsonNode schema)
+        {
+            var r = await _runner.RunAsync(agent, prompt, workflowRunId: wfRunId, hooks: hooks, ct: ct);
+            return new NodeResult(node.Id, r.Status == WorkflowRunStatus.Completed, r.Output, r.RunId);
+        }
+
+        var retries = node.Raw["output_retries"]?.GetValue<int>() ?? WorkflowDefinition.DefaultOutputRetries;
+        var structuredPrompt = $"{prompt}\n\n{JsonSchemaLite.DescribeForPrompt(schema)}";
+        var errors = new List<string>();
+        Guid? lastRun = null;
+        for (var attempt = 1; attempt <= retries + 1; attempt++)
+        {
+            var attemptPrompt = errors.Count == 0 ? structuredPrompt : $"{structuredPrompt}\n\n{RetryFeedback}\n- {string.Join("\n- ", errors)}";
+            var r = await _runner.RunAsync(agent, attemptPrompt, workflowRunId: wfRunId, hooks: hooks, ct: ct);
+            lastRun = r.RunId;
+            if (r.Status != WorkflowRunStatus.Completed) return new NodeResult(node.Id, false, r.Output, r.RunId);
+            var json = JsonSchemaLite.ExtractJson(r.Output);
+            errors = json == null ? new List<string> { "$: a resposta nao contem um JSON valido" } : JsonSchemaLite.Validate(schema, json);
+            if (errors.Count == 0) return new NodeResult(node.Id, true, json!.ToJsonString(), r.RunId);
+            Log.Warn($"no '{node.Id}': saida fora do output_schema (tentativa {attempt}/{retries + 1}): {string.Join("; ", errors)}");
+        }
+        return new NodeResult(node.Id, false, $"ERRO: saida fora do output_schema apos {retries + 1} tentativas: {string.Join("; ", errors)}", lastRun);
+    }
+
+    private async Task<NodeResult> RunToolNodeAsync(Guid wfRunId, WorkflowNode node, WorkflowValues values, IHumanGate gate,
+                                                    WorkflowToolRules? rules, CancellationToken ct)
+    {
+        var args = values.RenderJson(node.Raw["args"]) as JsonObject ?? new JsonObject();
+        var r = await _runner.RunToolAsync(node.Text("tool"), args, wfRunId, gate, rules, ct);
+        return new NodeResult(node.Id, r.Ok, r.Output, r.RunId);
+    }
+
+    /// <summary>Primeiro caso verdadeiro vence; sem nenhum, o default (ou nenhum destino).</summary>
+    private static NodeResult RunCondition(WorkflowNode node, WorkflowValues values)
+    {
+        var index = Enumerable.Range(0, node.Cases.Count).Cast<int?>().FirstOrDefault(i => ConditionEvaluator.Evaluate(node.Cases[i!.Value].When, values));
+        var chosen = index is { } i ? node.Cases[i].Next : node.Default;
+        var output = new JsonObject
+        {
+            ["case"] = index is { } c ? JsonValue.Create(c) : node.Default.Count > 0 ? JsonValue.Create("default") : null,
+            ["next"] = new JsonArray(chosen.Select(n => (JsonNode?)JsonValue.Create(n)).ToArray())
+        };
+        return new NodeResult(node.Id, true, output.ToJsonString(), ChosenNext: chosen);
     }
 }
