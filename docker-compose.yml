@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: agentpoc-postgres
+    environment:
+      POSTGRES_USER: agents
+      POSTGRES_PASSWORD: agents
+      POSTGRES_DB: agents
+    ports:
+      - "5433:5432"        # 5433 no host para nao conflitar com um Postgres local
+    volumes:
+      - agentpoc-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agents -d agents"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Busca na web self-hosted para a ferramenta web_search (opcional):
+  #   docker compose --profile search up -d   e   SEARXNG_URL=http://localhost:8888 no .env
+  searxng:
+    image: searxng/searxng:2026.10.19-81371861f
+    container_name: agentpoc-searxng
+    profiles: ["search"]
+    ports:
+      - "8888:8080"
+    volumes:
+      - ./infra/searxng/settings.yml:/etc/searxng/settings.yml:ro
+
+volumes:
+  agentpoc-pg:

@@ -1,0 +1,9 @@
+# Configuracao minima do SearXNG para a ferramenta web_search (precisa do formato json habilitado).
+use_default_settings: true
+server:
+  secret_key: "agentpoc-dev-somente-local"
+  limiter: false
+search:
+  formats:
+    - html
+    - json
