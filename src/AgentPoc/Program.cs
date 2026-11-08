@@ -101,7 +101,13 @@ try
             if (!await Preflight()) return 1;
             Log.Muted = !Flag("verbose");
             var port = int.TryParse(Opt("port"), out var p) ? p : 5080;
-            await new AgentPoc.Web.ChatServer(app).RunAsync(port, cts.Token);
+            await new AgentPoc.Web.ChatServer(app).RunAsync(port, startDispatcher: !Flag("no-dispatcher"), cts.Token);
+            break;
+        }
+        case "dispatcher":
+        {
+            var n = int.TryParse(Opt("concurrency"), out var c) ? c : 2;
+            await app.Dispatcher.RunAsync(n, TimeSpan.FromSeconds(30), cts.Token);
             break;
         }
         case "workflow":
@@ -253,12 +259,14 @@ void Help()
       sync-mcp                          importa tools dos servidores MCP habilitados
       chat [--agent assistant] [--conversation <id>] [--verbose] [--no-worker]
                                         conversa com um agente (streaming, ferramentas, delegacao, aprovacao)
-      serve [--port 5080] [--verbose]   chat web em http://localhost:5080 (API REST + SSE)
+      serve [--port 5080] [--no-dispatcher] [--verbose]
+                                        chat web em http://localhost:5080 (API REST + SSE)
       task <agente> "<texto>"           roda um agente (aprovacao interativa por padrao)
            [--budget N] [--approval auto|deny|ask]
       workflow <id> "<entrada>"         roda um workflow  [--crash-after <no>]
       workflow --resume <workflow_run>  retoma um workflow interrompido
       worker [--concurrency N] [--once] processa a fila de tarefas
+      dispatcher [--concurrency N]      so retoma runs prontos (decisao humana, prazo vencido, filho terminou)
       demo [autonomia|workflow|fila|governanca|retomada|all]
                                         roda os cenarios e grava evidencias em ./evidence
       report <run_id|workflow_run_id>   gera evidencia de qualquer execucao gravada

@@ -91,6 +91,12 @@ def need_tool(c, tool, query):
 
 def orchestrator(c):
     t = c.task.lower()
+    if "pergunte a pessoa" in t:
+        if not c.called("delegate_task"):
+            return [call("delegate_task", agent="researcher",
+                         task="Pergunte a pessoa qual ambiente usar no deploy (homologacao ou producao) e devolva a escolha.")]
+        return "Resultado do especialista: " + c.result("delegate_task")
+
     if "create_task" in t:
         if not c.called("create_task"):
             calls = []
@@ -145,6 +151,14 @@ def orchestrator(c):
 
 def researcher(c):
     t = c.task.lower()
+    if "pergunte a pessoa" in t:
+        if not c.called("ask_human"):
+            return [call("ask_human", question="Qual ambiente devo usar no deploy?", options=["homologacao", "producao"])]
+        answer = c.result("ask_human")
+        if answer.startswith("SEM RESPOSTA"):
+            return "Sem resposta da pessoa no prazo; replanejei e sigo com homologacao, a opcao mais segura."
+        return "A pessoa escolheu o ambiente: " + answer.replace("Resposta da pessoa:", "").strip()
+
     if "cep" in t:
         step = need_tool(c, "cep_lookup", "cep endereco")
         if step:

@@ -6,7 +6,7 @@ namespace AgentPoc.Human;
 public sealed record HumanRequest(
     Guid Id, Guid RunId, Guid? ConversationId, string Kind, string? ToolCallId, string Tool, JsonObject Args,
     string? PolicyReason, string? Question, string[] Options, string Status, string? Reason, JsonObject? EditedArgs,
-    string? Answer, DateTime CreatedAt);
+    string? Answer, DateTime CreatedAt, DateTime? ExpiresAt);
 
 /// <summary>Decisao de uma pessoa: aprovar/negar (com motivo e argumentos corrigidos) ou responder uma pergunta.</summary>
 public sealed record HumanDecision(bool? Approved, string? Reason, JsonObject? EditedArgs, string? Answer);
@@ -35,18 +35,21 @@ public sealed class HumanInputStore
         (await _db.QueryAsync($"{Select} where conversation_id = @c and status = 'pending' order by created_at", ("c", conversationId)))
         .Select(Map).ToList();
 
-    public async Task<Guid> CreateApprovalAsync(Guid runId, Guid? conversationId, string toolCallId, string tool, JsonObject args, string policyReason) =>
+    public async Task<Guid> CreateApprovalAsync(Guid runId, Guid? conversationId, string toolCallId, string tool, JsonObject args,
+                                                string policyReason, TimeSpan expiresIn) =>
         (Guid)(await _db.ScalarAsync(
-            @"insert into approvals (run_id, conversation_id, kind, tool_call_id, tool, args, policy_reason)
-              values (@r, @c, 'approval', @call, @t, @a, @p) returning id",
-            ("r", runId), ("c", conversationId), ("call", toolCallId), ("t", tool), ("a", args), ("p", policyReason)))!;
+            @"insert into approvals (run_id, conversation_id, kind, tool_call_id, tool, args, policy_reason, expires_at)
+              values (@r, @c, 'approval', @call, @t, @a, @p, now() + make_interval(secs => @exp)) returning id",
+            ("r", runId), ("c", conversationId), ("call", toolCallId), ("t", tool), ("a", args), ("p", policyReason),
+            ("exp", expiresIn.TotalSeconds)))!;
 
-    public async Task<Guid> CreateQuestionAsync(Guid runId, Guid? conversationId, string toolCallId, string question, IReadOnlyList<string> options) =>
+    public async Task<Guid> CreateQuestionAsync(Guid runId, Guid? conversationId, string toolCallId, string question,
+                                                IReadOnlyList<string> options, TimeSpan expiresIn) =>
         (Guid)(await _db.ScalarAsync(
-            @"insert into approvals (run_id, conversation_id, kind, tool_call_id, tool, question, options)
-              values (@r, @c, 'question', @call, 'ask_human', @q, @o) returning id",
+            @"insert into approvals (run_id, conversation_id, kind, tool_call_id, tool, question, options, expires_at)
+              values (@r, @c, 'question', @call, 'ask_human', @q, @o, now() + make_interval(secs => @exp)) returning id",
             ("r", runId), ("c", conversationId), ("call", toolCallId), ("q", question),
-            ("o", new JsonArray(options.Select(o => (JsonNode?)JsonValue.Create(o)).ToArray()))))!;
+            ("o", new JsonArray(options.Select(o => (JsonNode?)JsonValue.Create(o)).ToArray())), ("exp", expiresIn.TotalSeconds)))!;
 
     /// <summary>Grava a decisao se o pedido ainda estiver pendente. Retorna false se ja tinha sido decidido.</summary>
     public async Task<bool> DecideAsync(Guid id, string status, HumanDecision decision) =>
@@ -55,14 +58,9 @@ public sealed class HumanInputStore
                where id = @id and status = 'pending'",
             ("s", status), ("reason", decision.Reason), ("edited", decision.EditedArgs), ("answer", decision.Answer), ("id", id)) > 0;
 
-    public Task<int> ExpirePendingAsync(Guid conversationId, string reason) =>
-        _db.ExecAsync(
-            "update approvals set status = 'expired', reason = @reason, decided_at = now() where conversation_id = @c and status = 'pending'",
-            ("reason", reason), ("c", conversationId));
-
     private const string Select =
         @"select id, run_id, conversation_id, kind, tool_call_id, tool, args::text as args, policy_reason, question,
-                 options::text as options, status, reason, edited_args::text as edited_args, answer, created_at
+                 options::text as options, status, reason, edited_args::text as edited_args, answer, created_at, expires_at
             from approvals";
 
     private static HumanRequest Map(Dictionary<string, object?> r) => new(
@@ -70,5 +68,5 @@ public sealed class HumanInputStore
         JsonNode.Parse(r.S("args")) as JsonObject ?? new JsonObject(), r.SN("policy_reason"), r.SN("question"),
         r.SN("options") is { } o && JsonNode.Parse(o) is JsonArray arr ? arr.Select(x => x?.ToString() ?? "").ToArray() : Array.Empty<string>(),
         r.S("status"), r.SN("reason"), r.SN("edited_args") is { } e ? JsonNode.Parse(e) as JsonObject : null,
-        r.SN("answer"), r.T("created_at"));
+        r.SN("answer"), r.T("created_at"), r.TN("expires_at"));
 }

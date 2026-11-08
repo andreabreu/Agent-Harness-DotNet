@@ -54,16 +54,20 @@ ou mandar trabalho para a fila (`create_task`). Ferramentas com politica `approv
 
 ```bash
 cd src/AgentPoc
-dotnet run -- chat                 # terminal: streaming, aprovacao no prompt, Ctrl+C cancela o turno
-dotnet run -- serve                # web: http://localhost:5080
+dotnet run -- chat                 # terminal: streaming, decisoes no prompt, Ctrl+C cancela a cadeia do turno
+dotnet run -- serve                # web: http://localhost:5080 (API + tela + despachante)
+dotnet run -- serve --no-dispatcher  # no so de API/tela; a retomada fica com outras instancias
+dotnet run -- dispatcher           # instancia so de retomada (escala horizontal)
 ```
 
 - **Multi-turno persistente**: cada mensagem fica em `conversation_messages`; cada turno e um run
   (`runs.conversation_id`) com a mesma auditoria em `run_events`. Da para retomar com
   `chat --conversation <id>` ou pela lista na tela.
 - **Ferramentas descobertas continuam carregadas** nos turnos seguintes (`conversations.active_tools`).
-- **Streaming** do texto (OpenAI-compativel e Anthropic) e dos eventos: ferramentas, delegacoes com o
-  subagente identificado, plano, raciocinio, aprovacoes, tokens e custo ao vivo.
+- **Streaming**: a tela e o terminal acompanham a conversa pelos eventos gravados em `run_events` (todas as
+  instancias enxergam o mesmo), entao o turno aparece andando mesmo quando quem o retoma e outra instancia.
+  O texto token a token (OpenAI-compativel e Anthropic) chega quando o run executa no mesmo processo; vindo
+  de outra instancia, o texto aparece por mensagem completa (`assistant_message`).
 - **Contexto longo**: quando o historico passa de 50% da janela do modelo, os turnos antigos viram um
   resumo (`conversations.summary`); os 2 ultimos turnos ficam integrais. O custo do resumo vira um run.
 - **Memoria**: a cada turno, memorias relevantes do agente entram no prompt; o agente salva fatos com `memory_save`.
@@ -71,8 +75,9 @@ dotnet run -- serve                # web: http://localhost:5080
   resultado entra no proximo turno.
 - **Human-in-the-loop** (detalhes abaixo): aprovar, editar argumentos, negar com motivo, responder perguntas
   do agente (`ask_human`), com espera duravel.
-- **Cancelar**: botao Parar (web) ou Ctrl+C (terminal) encerra o turno e os subagentes como `cancelled`,
-  sem deixar o historico inconsistente.
+- **Cancelar**: botao Parar (web) ou Ctrl+C (terminal) cancela a cadeia inteira do turno: runs executando
+  (em qualquer instancia, avisadas por `NOTIFY`) e runs suspensos viram `cancelled`, e os pedidos pendentes
+  sao fechados, sem deixar o historico inconsistente.
 - **Busca**: `SEARXNG_URL` (self-hosted, `docker compose --profile search up -d`), `BRAVE_API_KEY`, ou
   DuckDuckGo Lite sem configuracao.
 
@@ -86,15 +91,30 @@ dotnet run -- serve                # web: http://localhost:5080
 | Pergunta do agente | `ask_human(question, options)`: o agente pergunta no meio da tarefa e continua com a resposta |
 | Regras por argumento | `tools.config`: `deny_when` bloqueia sem perguntar (ex.: `rm -rf`, `sudo`); `approval_when` exige aprovacao (ex.: `http_get` em URL interna) |
 
-**Espera duravel**: no agente raiz da conversa, o pedido nao segura processo. O run fica `waiting_human`, o
-pedido fica em `approvals` e, quando a pessoa decide (minutos ou dias depois, mesmo apos restart do servidor),
-o MESMO run e retomado do historico persistido: a tool call pendente e reexecutada e encontra a decisao gravada.
-Se a pessoa mandar outra mensagem sem decidir, o pedido expira e o turno suspenso e encerrado.
-Subagentes esperam em memoria (ate 10 min), porque o historico deles nao e persistido; um restart nesse
-momento perde a espera. Na CLI (`chat`, `task`) a decisao e no terminal (`s`/`n`/`e` para editar, motivo, resposta).
+**Espera duravel em toda a cadeia, so com Postgres.** Nenhuma espera humana fica em memoria:
 
-Nao precisa de Temporal para isso: o chat ja persiste tudo no Postgres. O Temporal passa a valer a pena para
-esperas longas dentro de workflows, tarefas da fila e subagentes, e para timers/escalonamento em volume.
+1. Quem pede uma pessoa (agente raiz ou subagente, via `ask_human` ou ferramenta `approval`) grava o pedido em
+   `approvals` (com prazo em `expires_at`), fica `waiting_human` e libera o processo.
+2. O pai de um subagente suspenso suspende junto: fica `waiting_child`, com `waiting_on_run_id` = filho e
+   `pending_tool_call_id` = a chamada `delegate_task`. Isso sobe ate o agente raiz.
+3. Gravar a decisao so marca o run que pediu como `ready` e avisa por `NOTIFY`. Nada e retomado dentro da
+   requisicao HTTP nem do prompt do terminal.
+4. O **despachante** (`ResumeDispatcher`, no `serve`, no `chat` ou sozinho com `dispatcher`) pega runs `ready`
+   com `FOR UPDATE SKIP LOCKED` e os retoma do historico persistido (`conversation_messages` no agente raiz,
+   `run_messages` nos demais). Acorda por `LISTEN/NOTIFY` e varre a cada 30 s. Varias instancias podem rodar o
+   despachante: cada run e retomado por uma so.
+5. Quando um filho termina, a saida dele vira o `tool_result` do `delegate_task` no pai, e o pai fica `ready`.
+   Filho que falhou ou foi cancelado chega ao pai como erro da ferramenta.
+6. Pedido sem resposta ate `expires_at` (padrao 24 h, `HITL_EXPIRES_HOURS`) e negado como `expired` pela
+   varredura; o run e retomado e o agente replaneja.
+7. Mensagem nova com a cadeia parada esperando alguem descarta a cadeia (`cancelled`, pedidos `expired`).
+
+Budget e contadores continuam nos mesmos runs: na retomada, o budget usado inclui os tokens dos subagentes.
+Na CLI (`chat`) a decisao e no terminal (`s`/`n`/`e` para editar, motivo, resposta); o comando `task`
+continua com a aprovacao interativa direta, sem suspensao.
+
+Nao precisa de Temporal para isso. O mesmo mecanismo (status + `ready` + despachante) serve depois para o
+no `human` do workflow e para tarefas da fila que esperam uma pessoa.
 
 API usada pela tela (sem autenticacao; escuta so em localhost):
 
@@ -103,17 +123,18 @@ API usada pela tela (sem autenticacao; escuta so em localhost):
 | GET | `/api/agents` | agentes habilitados |
 | GET/POST | `/api/conversations` | lista / cria (`{"agent":"assistant"}`) |
 | GET | `/api/conversations/{id}` | mensagens, resumo, ferramentas ativas, tokens, custo, aprovacoes pendentes |
-| POST | `/api/conversations/{id}/messages` | envia `{"text":"..."}` e recebe o turno em Server-Sent Events |
-| POST | `/api/conversations/{id}/cancel` | cancela o turno em andamento |
-| POST | `/api/approvals/{id}` | decide `{"approved":true,"reason":"...","args":{...}}` ou responde `{"answer":"..."}`; se o turno estava suspenso, responde com o SSE da continuacao |
-| POST | `/api/conversations/{id}/resume` | continua (SSE) um turno suspenso cuja decisao ja foi gravada |
+| GET | `/api/conversations/{id}/stream?after=<id>` | Server-Sent Events da conversa (eventos gravados + texto ao vivo; reconecta por `Last-Event-ID`) |
+| POST | `/api/conversations/{id}/messages` | envia `{"text":"..."}`; responde 202 e o turno roda em segundo plano |
+| POST | `/api/conversations/{id}/cancel` | cancela a cadeia do turno (em todas as instancias) |
+| POST | `/api/approvals/{id}` | decide `{"approved":true,"reason":"...","args":{...}}` ou responde `{"answer":"..."}`; so grava |
 
 ## Comandos
 
 | Comando | O que faz |
 |---|---|
 | `chat [--agent assistant] [--conversation <id>] [--verbose] [--no-worker]` | chat no terminal |
-| `serve [--port 5080]` | chat web + API |
+| `serve [--port 5080] [--no-dispatcher]` | chat web + API (+ despachante, a menos de `--no-dispatcher`) |
+| `dispatcher [--concurrency N]` | so retoma runs prontos (decisao humana, prazo vencido, filho que terminou) |
 | `setup [--reset]` | cria/atualiza o schema e o seed (idempotente; `--reset` apaga tudo) |
 | `check` | valida o `.env` e testa tool calling em cada modelo usado pelos agentes |
 | `agents` / `tools` | mostra a configuracao lida do banco |
@@ -136,15 +157,22 @@ Opcoes: `--approval auto|deny|ask`, `--budget <tokens>`.
 | `fila` | Orquestrador cria tarefas na fila e nao espera; 3 workers concorrentes pegam com `FOR UPDATE SKIP LOCKED` |
 | `governanca` | `run_shell` (approval) negado, `delete_file` (deny) bloqueado, e um run com budget pequeno interrompido |
 | `retomada` | Queda simulada no meio do workflow; a retomada reaproveita os nos concluidos sem reexecutar |
-| `hitl` | Pergunta com retomada por outra instancia (restart), aprovar com edicao, negar com motivo, regra deny_when, regra approval_when, subagente esperando em memoria, pendencia descartada |
+| `hitl` | Pergunta respondida por outra instancia (restart), aprovar com edicao, negar com motivo, regra deny_when, regra approval_when, subagente suspenso com o pai, pendencia descartada |
+| `hitl_sub` | Orquestrador delega a um subagente que chama `ask_human`: filho `waiting_human`, pai `waiting_child`; outra instancia responde; o despachante retoma de baixo para cima e o pai termina com a resposta do filho |
+| `hitl_concorrencia` | 4 cadeias suspensas, duas instancias com despachante: cada run retomado uma vez, sem eventos duplicados |
+| `hitl_expira` | Pedido vencido: negado como `expired`, o subagente replaneja e o pai termina |
+| `hitl_cancela` | Cancelar o raiz com subagente suspenso: toda a cadeia `cancelled`, pedido fechado, nada retomado |
 | `chat` | Conversa de 5 turnos: pesquisa na web, plano + delegacao, resposta pelo historico, aprovacao negada, ferramentas persistidas, streaming e compactacao em resumo |
 
 ## Como funciona
 
 ```
 src/AgentPoc/
-  Harness/AgentRunner.cs    o loop do agente, budget, compactacao de contexto, eventos
-  Harness/ToolExecutor.cs   politica auto/approval/deny + execucao + auditoria
+  Harness/AgentRunner.cs    o loop do agente, budget, compactacao de contexto, eventos, suspensao e retomada
+  Harness/ToolExecutor.cs   politica auto/approval/deny (+ regras por argumento) + execucao + auditoria
+  Harness/RunChain.cs       transicoes duraveis entre runs: ready, entrega filho -> pai, expiracao, cancelamento
+  Harness/ResumeDispatcher.cs  retoma runs ready (SKIP LOCKED, LISTEN/NOTIFY, varredura)
+  Human/                    pedidos humanos (approvals) e o gate duravel
   Tools/BuiltinTools.cs     search_tools, delegate_task, create_task, memoria, KB, arquivos, shell, web
   Tools/HttpTool.cs         executor generico de ferramentas HTTP definidas so no banco
   Tools/McpClient.cs        cliente MCP via stdio (tools/list e tools/call)
@@ -166,7 +194,12 @@ sql/schema.sql, seed.sql    tudo que define comportamento
 - **Delegacao**: e so uma ferramenta. `delegate_task` cria um run filho com contexto limpo e budget
   que e uma fatia do saldo do pai (consumo do filho desconta do pai); profundidade maxima 3.
   `create_task` faz a versao assincrona, via fila.
-- **Politicas**: cada ferramenta tem `policy` = `auto`, `approval` ou `deny`. Toda decisao fica auditada.
+- **Politicas**: cada ferramenta tem `policy` = `auto`, `approval` ou `deny`, refinada por regras por
+  argumento (`deny_when`, `approval_when`). Toda decisao fica auditada.
+- **Suspensao duravel**: um run pode parar sem processo preso (`waiting_human`, `waiting_child`), com todo o
+  historico no banco. Qualquer instancia com o despachante retoma o mesmo run quando ele fica `ready`.
+  Estados: `running` -> `waiting_human` | `waiting_child` -> `ready` -> `running` -> `completed`/... ;
+  suspensos podem ir direto para `cancelled`.
 
 ## Configurando pelo banco (sem recompilar)
 
@@ -209,6 +242,12 @@ nos formatos OpenAI e Anthropic; `web_search` com busca real via SearXNG e DuckD
 `--reset` sobre banco existente; HITL na tela (responder pergunta depois de derrubar e subir o servidor,
 editar argumentos e aprovar). Testes unitarios: `dotnet test tests/AgentPoc.Tests` (28 testes).
 
+Com a suspensao duravel em toda a cadeia: os 11 cenarios passaram 69/69 checagens; `hitl_concorrencia` 5
+rodadas seguidas sem falha; `tests/hitl_restart.sh` (processo encerrado com `kill -9` com a pergunta do
+subagente pendente, processo novo responde e termina a cadeia); tela servida por um processo sem
+despachante mostrando a retomada feita por outro processo (`dispatcher`); `chat` no terminal com decisao no
+prompt. Testes unitarios: 52.
+
 Nao testado: contra o Azure Foundry real (inclusive `stream_options` e `reasoning_effort` no deployment)
 e a Brave Search API. O primeiro `dotnet run -- check` com o `.env` preenchido confirma o modelo.
 
@@ -219,9 +258,17 @@ e a Brave Search API. O primeiro `dotnet run -- check` com o `.env` preenchido c
 - O budget e checado entre chamadas ao modelo, entao um run pode passar do limite em uma chamada.
 - Na CLI a aprovacao e por terminal ou pelo modo global (`APPROVAL_MODE`); no worker o modo `ask` pausa tudo.
 - Sem multi-tenant e sem autenticacao: o `serve` escuta so em localhost.
-- Turno do chat web vive no processo: se o servidor cair no meio, as mensagens ja gravadas ficam, as
-  tool calls sem resultado sao marcadas como interrompidas no proximo turno, mas o turno nao e retomado.
-- Aprovacao de subagente na web espera em memoria ate 10 minutos; depois segue como expirada.
+- Espera humana e duravel, mas a EXECUCAO nao: se uma instancia cair enquanto um run esta `running` (gerando
+  com o modelo ou rodando ferramenta), ele fica `running` sem dono. Falta lease/heartbeat por run para outra
+  instancia reivindica-lo; hoje a mensagem nova na conversa responde "ocupado" ate alguem marcar o run.
+- Ferramentas reexecutadas na retomada sao so as que ainda nao tinham resultado; nao ha idempotencia para uma
+  ferramenta que chegou a executar mas o processo caiu antes de gravar o resultado.
+- Ha uma janela de milissegundos na entrega filho -> pai (resultado gravado, pai ainda nao `ready`); uma queda
+  exatamente ali deixa o pai em `waiting_child` sem filho; a varredura nao recupera esse caso.
+- Texto token a token so aparece quando o run executa no mesmo processo que serve a tela; de outra instancia,
+  por mensagem completa. O stream da tela le o banco a cada 250 ms.
+- Tarefas da fila (`worker`) e nos de workflow ainda nao esperam pessoa: usam o modo de aprovacao da CLI
+  (`APPROVAL_MODE`, padrao `auto` no `serve`).
 - Sem autenticacao, nao ha registro de QUEM decidiu nem aprovador por papel/notificacao (Teams, e-mail).
 - DuckDuckGo Lite e raspagem de HTML e pode limitar por excesso de uso; em producao use SearXNG ou uma API.
 - O MCP suporta so stdio e so tools (sem resources, prompts nem HTTP/SSE).

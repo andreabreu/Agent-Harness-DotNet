@@ -38,8 +38,58 @@ public static class Demo
             "O agente pergunta a pessoa (ask_human) e o run fica suspenso sem processo preso; outra instancia da aplicacao (simulando " +
             "um restart) grava a resposta e retoma o MESMO run. A pessoa corrige os argumentos antes de aprovar, nega com motivo (o agente " +
             "recebe o motivo), regras por argumento bloqueiam comando perigoso sem perguntar e exigem aprovacao para URL interna, um subagente " +
-            "espera a decisao em memoria, e uma pendencia expira quando a pessoa segue a conversa.", new ScenarioFn(Hitl)),
+            "suspende de forma duravel junto com o pai, e uma pendencia expira quando a pessoa segue a conversa.", new ScenarioFn(Hitl)),
+        ("hitl_sub", "HITL em subagente: a suspensao sobe a cadeia e o despachante retoma de baixo para cima",
+            "O orquestrador delega a um subagente que chama ask_human. O filho fica waiting_human e o pai waiting_child, sem processo " +
+            "preso. Uma segunda instancia da aplicacao grava a resposta; o despachante retoma o filho, a saida dele vira o tool_result " +
+            "do delegate_task no pai, e o pai termina com a resposta do filho.", new ScenarioFn(HitlSub)),
+        ("hitl_concorrencia", "Despachante em duas instancias: cada run retomado uma unica vez",
+            "Quatro conversas ficam suspensas em subagentes. Duas instancias da aplicacao rodam o despachante ao mesmo tempo; " +
+            "FOR UPDATE SKIP LOCKED garante que cada run e retomado por uma so, sem eventos duplicados.", new ScenarioFn(HitlConcorrencia)),
+        ("hitl_expira", "Pedido humano expirado: negado como expired e o agente replaneja",
+            "O prazo do pedido vence sem resposta. A varredura do despachante nega o pedido como expired, retoma o subagente, " +
+            "que replaneja com a opcao mais segura, e o pai termina normalmente.", new ScenarioFn(HitlExpira)),
+        ("hitl_cancela", "Cancelar o agente raiz cancela a cadeia suspensa inteira",
+            "Com o subagente esperando uma pessoa, o cancelamento do turno marca raiz e filho como cancelled, fecha o pedido " +
+            "pendente e nada e retomado depois.", new ScenarioFn(HitlCancela)),
     };
+
+    private static readonly TimeSpan DemoDispatcherSweep = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan SettleTimeout = TimeSpan.FromSeconds(60);
+    private const string SubagentQuestionPrompt = "Pergunte a pessoa, via especialista, qual ambiente usar no deploy.";
+
+    /// <summary>Roda o cenario com o despachante desta instancia ativo (retoma runs prontos).</summary>
+    private static async Task WithDispatcherAsync(App app, CancellationToken ct, Func<Task> body)
+    {
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var dispatcher = Task.Run(() => app.Dispatcher.RunAsync(2, DemoDispatcherSweep, stop.Token));
+        try
+        {
+            await body();
+        }
+        finally
+        {
+            stop.Cancel();
+            try { await dispatcher; } catch (OperationCanceledException) { /* encerrado */ }
+        }
+    }
+
+    /// <summary>Conversa com o orquestrador parada: subagente esperando uma pessoa (waiting_human) e pai em waiting_child.</summary>
+    private static async Task<(Guid Conversation, RunResult Root, HumanRequest Request)> SuspendedSubagentAsync(App app, EvidenceSession s, CancellationToken ct)
+    {
+        var conversation = await app.Chat.StartAsync("orchestrator");
+        var root = await app.Chat.SendAsync(conversation, SubagentQuestionPrompt, new RunHooks(null, app.HumanGate), ct);
+        s.RootRuns.Add(root.RunId);
+        var request = (await app.Chat.Human.PendingAsync(conversation)).Single();
+        Log.Write(0, ConsoleColor.Yellow, root.Status, $"raiz {Text.Short(root.RunId)} parada; pedido {Text.Short(request.Id)}: {request.Question}");
+        return (conversation, root, request);
+    }
+
+    private static async Task<int> CountEventsAsync(App app, Guid runId, string type) =>
+        Convert.ToInt32(await app.Db.ScalarAsync("select count(*) from run_events where run_id = @r and type = @t", ("r", runId), ("t", type)));
+
+    private static async Task<string> RunStatusAsync(App app, Guid runId) =>
+        (string)(await app.Db.ScalarAsync("select status from runs where id = @id", ("id", runId)))!;
 
     public static IEnumerable<string> Names => Scenarios.Select(s => s.Id);
 
@@ -311,7 +361,10 @@ public static class Demo
                     $"ferramentas ativas: {string.Join(", ", final?.ActiveTools ?? Array.Empty<string>())}.");
     }
 
-    private static async Task Hitl(App app, EvidenceSession s, CancellationToken ct)
+    private static Task Hitl(App app, EvidenceSession s, CancellationToken ct) =>
+        WithDispatcherAsync(app, ct, () => HitlTurns(app, s, ct));
+
+    private static async Task HitlTurns(App app, EvidenceSession s, CancellationToken ct)
     {
         Approval.Mode = "auto";
         Clean("custo.py");
@@ -320,13 +373,13 @@ public static class Demo
         var results = new Dictionary<string, RunResult>();
         var suspended = new Dictionary<string, RunResult>();
         var decided = new Dictionary<string, HumanRequest>();
-        var subagentDecidedInMemory = false;
+        var subagentSuspendedDurably = false;
         HumanRequest? discarded = null;
         string? discardedRunStatus = null;
 
         s.Checks.Add(new Check("ask_human suspendeu o run (waiting_human) sem segurar processo",
             _ => suspended.TryGetValue("pergunta", out var w) && w.Status == "waiting_human" && w.WaitingFor != null));
-        s.Checks.Add(new Check("Outra instancia da aplicacao (restart simulado) gravou a resposta e retomou o MESMO run ate completed",
+        s.Checks.Add(new Check("Outra instancia da aplicacao (restart simulado) gravou a resposta e o despachante retomou o MESMO run ate completed",
             _ => results.TryGetValue("pergunta", out var r) && r.Status == "completed" && r.RunId == suspended["pergunta"].RunId &&
                  r.Output.Contains("markdown")));
         s.Checks.Add(new Check("Pessoa corrigiu os argumentos antes de aprovar e o comando executado foi o corrigido (ls -la)",
@@ -340,8 +393,8 @@ public static class Demo
         s.Checks.Add(new Check("Regra approval_when exigiu aprovacao para http_get em URL interna (politica normal e auto)",
             d => suspended.ContainsKey("interna") && d.OfType("policy").Any(e => e.Str("tool") == "http_get" && e.Str("decision") == "approved" &&
                  e.Str("policy_reason").Contains("approval_when")) && d.ToolSucceeded("http_get")));
-        s.Checks.Add(new Check("Subagente (coder) esperou a aprovacao em memoria e o turno terminou com o valor real (92,50)",
-            _ => subagentDecidedInMemory && results.TryGetValue("subagente", out var r) && Regex.IsMatch(r.Output, @"92[\.,]5")));
+        s.Checks.Add(new Check("Subagente (coder) suspendeu de forma duravel com o pai (waiting_child) e a cadeia terminou com o valor real (92,50)",
+            _ => subagentSuspendedDurably && results.TryGetValue("subagente", out var r) && Regex.IsMatch(r.Output, @"92[\.,]5")));
         s.Checks.Add(new Check("Pessoa seguiu a conversa sem decidir: pedido expirou, turno suspenso encerrado e a conversa continuou",
             _ => discarded?.Status == "expired" && discardedRunStatus == "cancelled" &&
                  results.TryGetValue("seguiu", out var r) && r.Status == "completed"));
@@ -353,19 +406,18 @@ public static class Demo
             Log.Write(0, ConsoleColor.Cyan, "pessoa", text);
             var r = await app.Chat.SendAsync(conversation, text, hooks, ct);
             s.RootRuns.Add(r.RunId);
-            Log.Write(0, r.Status == "waiting_human" ? ConsoleColor.Yellow : ConsoleColor.Green, r.Status, r.Output);
-            (r.Status == "waiting_human" ? suspended : results)[key] = r;
+            var waiting = RunStatus.IsSuspended(r.Status);
+            Log.Write(0, waiting ? ConsoleColor.Yellow : ConsoleColor.Green, r.Status, r.Output);
+            (waiting ? suspended : results)[key] = r;
             return r;
         }
 
         async Task Decide(App via, string key, HumanDecision decision)
         {
-            var requestId = suspended[key].WaitingFor!.Value;
-            var outcome = await via.Chat.DecideAsync(requestId, decision);
-            decided[key] = (await via.Chat.Human.GetAsync(requestId))!;
+            var request = (await via.Chat.Human.PendingAsync(conversation)).Single();
+            decided[key] = await via.Chat.DecideAsync(request.Id, decision);
             Log.Write(0, ConsoleColor.Magenta, "decisao", $"{decided[key].Status}: {decided[key].Reason ?? decided[key].Answer}");
-            if (!outcome.NeedsResume) return;
-            var resumed = await via.Chat.ResumeAsync(conversation, hooks with { Human = via.HumanGate }, ct);
+            var resumed = await app.Chain.WaitUntilSettledAsync(suspended[key].RunId, SettleTimeout, ct);
             Log.Write(0, ConsoleColor.Green, resumed.Status, resumed.Output);
             results[key] = resumed;
         }
@@ -386,21 +438,10 @@ public static class Demo
         await Send("interna", "baixe http://127.0.0.1:8765/fake/cep/01310100");
         if (suspended.ContainsKey("interna")) await Decide(app, "interna", new HumanDecision(true, null, null, null));
 
-        var subagentTurn = app.Chat.SendAsync(conversation, "calcule com um script o custo de 1000 execucoes de agente", hooks, ct);
-        while (!subagentTurn.IsCompleted)
-        {
-            if ((await app.Chat.Human.PendingAsync(conversation)).FirstOrDefault() is { } pending)
-            {
-                var outcome = await app.Chat.DecideAsync(pending.Id, new HumanDecision(true, null, null, null));
-                subagentDecidedInMemory = !outcome.NeedsResume;
-                decided["subagente"] = (await app.Chat.Human.GetAsync(pending.Id))!;
-                break;
-            }
-            await Task.Delay(100, ct);
-        }
-        var sub = await subagentTurn;
-        s.RootRuns.Add(sub.RunId);
-        results["subagente"] = sub;
+        var sub = await Send("subagente", "calcule com um script o custo de 1000 execucoes de agente");
+        subagentSuspendedDurably = sub.Status == RunStatus.WaitingChild && sub.WaitingOnRun is { } coderRun &&
+                                   await RunStatusAsync(app, coderRun) == RunStatus.WaitingHuman;
+        await Decide(app, "subagente", new HumanDecision(true, null, null, null));
 
         var left = await Send("pendente", "liste os arquivos usando o shell");
         var leftRequest = left.WaitingFor;
@@ -409,6 +450,110 @@ public static class Demo
         discardedRunStatus = (string?)await app.Db.ScalarAsync("select status from runs where id = @id", ("id", left.RunId));
         s.Notes.Add($"Conversa {conversation}.");
     }
+
+    private static Task HitlSub(App app, EvidenceSession s, CancellationToken ct) => WithDispatcherAsync(app, ct, async () =>
+    {
+        var (conversation, root, request) = await SuspendedSubagentAsync(app, s, ct);
+        var childId = root.WaitingOnRun;
+        var childStatus = childId is { } c ? await RunStatusAsync(app, c) : "";
+        var parentRow = await app.Db.QueryOneAsync("select pending_tool_call_id from runs where id = @id", ("id", root.RunId));
+        var delegateCallId = (await app.Chat.Store.LoadMessagesAsync(conversation))
+            .SelectMany(m => m.Message.ToolCalls ?? new List<Llm.ToolCall>()).FirstOrDefault(t => t.Name == "delegate_task")?.Id;
+
+        Log.Info("Segunda instancia da aplicacao grava a resposta; o despachante desta instancia retoma a cadeia.");
+        await using (var other = new App(app.ConnectionString))
+            await other.Chat.DecideAsync(request.Id, new HumanDecision(null, null, null, "producao"));
+        var final = await app.Chain.WaitUntilSettledAsync(root.RunId, SettleTimeout, ct);
+        Log.Write(0, ConsoleColor.Green, final.Status, final.Output);
+        var delivered = (await app.Chat.Store.LoadMessagesAsync(conversation))
+            .FirstOrDefault(m => m.Message.Role == "tool" && m.Message.ToolCallId == delegateCallId)?.Message.Content ?? "";
+        var childFinal = childId is { } cid ? await RunStatusAsync(app, cid) : "";
+        var childResumes = childId is { } c2 ? await CountEventsAsync(app, c2, "run_resumed") : 0;
+        var parentResumes = await CountEventsAsync(app, root.RunId, "run_resumed");
+
+        s.Checks.Add(new Check("Subagente pediu uma pessoa e ficou waiting_human", _ => childStatus == RunStatus.WaitingHuman && request.RunId == childId));
+        s.Checks.Add(new Check("Pai suspendeu junto: waiting_child apontando para o filho", _ => root.Status == RunStatus.WaitingChild && root.WaitingOnRun == childId));
+        s.Checks.Add(new Check("Pai guardou a chamada delegate_task que vai receber o resultado (pending_tool_call_id)",
+            _ => delegateCallId != null && parentRow?.SN("pending_tool_call_id") == delegateCallId));
+        s.Checks.Add(new Check("Saida do filho virou o tool_result do delegate_task no pai", _ => delivered.Contains("[resultado de researcher") && delivered.Contains("producao")));
+        s.Checks.Add(new Check("Filho e pai foram retomados uma vez cada (mesmos runs, de baixo para cima)",
+            _ => childResumes == 1 && parentResumes == 1 && childFinal == RunStatus.Completed));
+        s.Checks.Add(new Check("Pai terminou com a resposta do filho", _ => final.Status == RunStatus.Completed && final.Output.Contains("producao")));
+        s.Notes.Add($"Conversa {conversation}: raiz {root.RunId}, filho {childId}.");
+    });
+
+    private const int ConcurrentConversations = 4;
+
+    private static async Task HitlConcorrencia(App app, EvidenceSession s, CancellationToken ct)
+    {
+        var chains = new List<(Guid Conversation, RunResult Root, HumanRequest Request)>();
+        for (var i = 0; i < ConcurrentConversations; i++) chains.Add(await SuspendedSubagentAsync(app, s, ct));
+
+        await using var instanceA = new App(app.ConnectionString);
+        await using var instanceB = new App(app.ConnectionString);
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var dispatchers = new[]
+        {
+            Task.Run(() => instanceA.Dispatcher.RunAsync(2, DemoDispatcherSweep, stop.Token)),
+            Task.Run(() => instanceB.Dispatcher.RunAsync(2, DemoDispatcherSweep, stop.Token))
+        };
+        await Task.WhenAll(chains.Select(c => app.Chat.DecideAsync(c.Request.Id, new HumanDecision(null, null, null, "homologacao"))));
+        var finals = new List<RunResult>();
+        foreach (var c in chains) finals.Add(await app.Chain.WaitUntilSettledAsync(c.Root.RunId, SettleTimeout, ct));
+        stop.Cancel();
+        try { await Task.WhenAll(dispatchers); } catch (OperationCanceledException) { /* encerrado */ }
+
+        var runIds = chains.SelectMany(c => new[] { c.Root.RunId, c.Root.WaitingOnRun!.Value }).ToArray();
+        var resumes = await app.Db.QueryAsync(
+            "select run_id, count(*) as n, min(data->>'by') as by_min, max(data->>'by') as by_max from run_events where run_id = any(@ids) and type = 'run_resumed' group by run_id",
+            ("ids", runIds));
+        var duplicatedSeq = Convert.ToInt32(await app.Db.ScalarAsync(
+            "select count(*) from (select run_id, seq from run_events where run_id = any(@ids) group by run_id, seq having count(*) > 1) d", ("ids", runIds)));
+        var deliveries = Convert.ToInt32(await app.Db.ScalarAsync(
+            "select count(*) from conversation_messages where conversation_id = any(@c) and role = 'tool' and tool_name = 'delegate_task'",
+            ("c", chains.Select(c => c.Conversation).ToArray())));
+        var instances = resumes.SelectMany(r => new[] { r.S("by_min"), r.S("by_max") }).Distinct().ToList();
+
+        s.Checks.Add(new Check($"As {ConcurrentConversations} cadeias terminaram como completed", _ => finals.All(f => f.Status == RunStatus.Completed)));
+        s.Checks.Add(new Check("Cada run (pai e filho) foi retomado exatamente uma vez",
+            _ => resumes.Count == runIds.Length && resumes.All(r => r.I("n") == 1)));
+        s.Checks.Add(new Check("Nenhum evento duplicado (run_id, seq) nos run_events", _ => duplicatedSeq == 0));
+        s.Checks.Add(new Check("Cada pai recebeu o resultado do filho uma unica vez", _ => deliveries == ConcurrentConversations));
+        s.Notes.Add($"Instancias que retomaram runs: {string.Join(", ", instances)} (despachantes: {instanceA.Dispatcher.Name}, {instanceB.Dispatcher.Name}).");
+    }
+
+    private static Task HitlExpira(App app, EvidenceSession s, CancellationToken ct) => WithDispatcherAsync(app, ct, async () =>
+    {
+        var (conversation, root, request) = await SuspendedSubagentAsync(app, s, ct);
+        s.Notes.Add("O prazo (expires_at, padrao 24 h) e antecipado para agora, simulando o tempo passando sem resposta.");
+        await app.Db.ExecAsync("update approvals set expires_at = now() - interval '1 second' where id = @id", ("id", request.Id));
+        while ((await app.Chat.Human.GetAsync(request.Id))?.Status == "pending") await Task.Delay(100, ct);
+        var final = await app.Chain.WaitUntilSettledAsync(root.RunId, SettleTimeout, ct);
+        var expired = await app.Chat.Human.GetAsync(request.Id);
+        var childOutput = (string?)await app.Db.ScalarAsync("select output from runs where id = @id", ("id", request.RunId)) ?? "";
+        Log.Write(0, ConsoleColor.Green, final.Status, final.Output);
+
+        s.Checks.Add(new Check("Pedido vencido foi negado como expired pela varredura do despachante", _ => expired?.Status == "expired"));
+        s.Checks.Add(new Check("Subagente foi retomado e replanejou sem a resposta", _ => childOutput.Contains("replanejei")));
+        s.Checks.Add(new Check("Pai terminou normalmente com o replanejamento do filho",
+            _ => final.Status == RunStatus.Completed && final.Output.Contains("replanejei")));
+    });
+
+    private static Task HitlCancela(App app, EvidenceSession s, CancellationToken ct) => WithDispatcherAsync(app, ct, async () =>
+    {
+        var (conversation, root, request) = await SuspendedSubagentAsync(app, s, ct);
+        var cancelled = await app.Chat.CancelAsync(conversation);
+        await Task.Delay(DemoDispatcherSweep * 2, ct);
+        var rootStatus = await RunStatusAsync(app, root.RunId);
+        var childStatus = await RunStatusAsync(app, request.RunId);
+        var closed = await app.Chat.Human.GetAsync(request.Id);
+        var resumed = await CountEventsAsync(app, root.RunId, "run_resumed") + await CountEventsAsync(app, request.RunId, "run_resumed");
+
+        s.Checks.Add(new Check("Cancelamento aceito com a cadeia suspensa", _ => cancelled));
+        s.Checks.Add(new Check("Raiz e subagente viraram cancelled", _ => rootStatus == RunStatus.Cancelled && childStatus == RunStatus.Cancelled));
+        s.Checks.Add(new Check("Pedido pendente foi fechado (expired, motivo cancelamento)", _ => closed?.Status == "expired" && closed.Reason!.Contains("cancelado")));
+        s.Checks.Add(new Check("Nada foi retomado depois do cancelamento", _ => resumed == 0));
+    });
 
     private sealed class CountingObserver : IRunObserver
     {

@@ -70,6 +70,54 @@ public sealed class Db : IAsyncDisposable
     public async Task<Dictionary<string, object?>?> QueryOneAsync(string sql, params (string Name, object? Value)[] ps) =>
         (await QueryAsync(sql, ps)).FirstOrDefault();
 
+    public Task NotifyAsync(string channel, string payload) =>
+        ExecAsync("select pg_notify(@ch, @p)", ("ch", channel), ("p", payload));
+
+    /// <summary>
+    /// Conexao dedicada que escuta canais do Postgres (LISTEN) e chama <paramref name="onNotification"/>
+    /// com (canal, payload) a cada NOTIFY. Descartar o retorno encerra a escuta.
+    /// </summary>
+    public async Task<IAsyncDisposable> ListenAsync(IEnumerable<string> channels, Action<string, string> onNotification, CancellationToken ct)
+    {
+        var conn = await _ds.OpenConnectionAsync(ct);
+        conn.Notification += (_, e) => onNotification(e.Channel, e.Payload);
+        foreach (var channel in channels)
+        {
+            await using var cmd = new NpgsqlCommand($"listen {channel}", conn);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        return new Listener(conn, ct);
+    }
+
+    private sealed class Listener : IAsyncDisposable
+    {
+        private readonly NpgsqlConnection _conn;
+        private readonly CancellationTokenSource _stop;
+        private readonly Task _loop;
+
+        public Listener(NpgsqlConnection conn, CancellationToken ct)
+        {
+            _conn = conn;
+            _stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _loop = Task.Run(async () =>
+            {
+                try
+                {
+                    while (!_stop.IsCancellationRequested) await _conn.WaitAsync(_stop.Token);
+                }
+                catch (OperationCanceledException) { /* encerrando */ }
+            });
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _stop.Cancel();
+            try { await _loop; } catch { /* conexao ja encerrada */ }
+            await _conn.DisposeAsync();
+            _stop.Dispose();
+        }
+    }
+
     public ValueTask DisposeAsync() => _ds.DisposeAsync();
 }
 

@@ -121,8 +121,8 @@ form { border-top: 1px solid var(--border); background: var(--panel); padding: 1
 </div>
 <script>
 const $ = id => document.getElementById(id);
-const state = { conv: null, running: false };
-const SILENT_TOOLS = new Set(["think", "update_plan", "delegate_task"]);
+const state = { conv: null, running: false, turn: null, stream: null, cards: new Map(), liveTokens: 0, liveCost: 0 };
+const SILENT_TOOLS = new Set(["think", "update_plan", "delegate_task", "ask_human"]);
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -178,12 +178,18 @@ async function loadAgents() {
   $("agentSelect").innerHTML = agents.map(a => `<option value="${esc(a.id)}" ${a.id === "assistant" ? "selected" : ""}>${esc(a.id)}</option>`).join("");
 }
 
+function statusLabel(status) {
+  if (status === "running" || status === "ready") return " · em andamento";
+  if (status === "waiting_human" || status === "waiting_child") return " · esperando você";
+  return "";
+}
+
 async function loadConversations() {
   const list = await api("/api/conversations");
   $("convs").innerHTML = list.map(c => `
     <div class="conv ${state.conv === c.id ? "active" : ""}" data-id="${c.id}">
       <div class="t">${esc(c.title || "(nova conversa)")}</div>
-      <div class="m">${esc(c.agent)} · ${new Date(c.updated_at).toLocaleString("pt-BR")}${c.busy ? " · em andamento" : ""}</div>
+      <div class="m">${esc(c.agent)} · ${new Date(c.updated_at).toLocaleString("pt-BR")}${statusLabel(c.status)}</div>
     </div>`).join("");
   for (const el of document.querySelectorAll(".conv")) el.onclick = () => openConversation(el.dataset.id);
 }
@@ -239,11 +245,12 @@ function renderPlan(t, steps) {
 function realClick(e) { return e.isTrusted && e.detail !== 0; } // so clique de mouse: nunca decidir por script ou tecla Enter
 
 function renderApproval(t, evt) {
+  if (state.cards.has(evt.approval_id)) return;
   const card = document.createElement("div");
   card.className = "approval";
-  const hint = evt.durable
-    ? "A conversa fica pausada até você decidir; pode fechar a página e voltar depois."
-    : "Um subagente está esperando esta decisão (até 10 minutos).";
+  state.cards.set(evt.approval_id, card);
+  const expires = evt.expires_at ? ` Expira em ${new Date(evt.expires_at).toLocaleString("pt-BR")}.` : "";
+  const hint = `A conversa fica pausada, sem custo, até você decidir; pode fechar a página e voltar depois.${expires}`;
   if (evt.kind === "question") {
     const options = (evt.options || []).map(o => `<button type="button" class="opt">${esc(o)}</button>`).join("");
     card.innerHTML = `
@@ -285,6 +292,7 @@ function renderApproval(t, evt) {
   scrollDown();
 }
 
+/** So grava a decisao: quem retoma o turno e o despachante, e a tela acompanha pelo stream. */
 async function decide(card, evt, payload, label) {
   const controls = card.querySelectorAll("button, textarea, input");
   controls.forEach(x => x.disabled = true);
@@ -298,15 +306,44 @@ async function decide(card, evt, payload, label) {
   }
   card.querySelector(".actions").textContent = label;
   card.querySelectorAll(".options, textarea, input").forEach(x => x.remove());
-  if ((resp.headers.get("content-type") || "").includes("text/event-stream")) await runStream(resp);
+  setRunning(true);
+}
+
+function closeTurn(t, finished) {
+  for (const actions of t.el.querySelectorAll(".approval .actions")) {
+    if (actions.querySelector("button")) actions.textContent = "Sem decisão: o turno terminou.";
+  }
+  if (!t.hasText && finished.output) appendText(t, finished.output);
+  if (finished.status !== "completed") addRow(t, `turno terminou como <b>${esc(finished.status)}</b>`, "fail");
+  t.activity.open = false;
+  const f = document.createElement("div");
+  f.className = "footer";
+  f.textContent = finished.steps !== undefined
+    ? `${finished.status} · ${finished.steps} passos · ${(finished.tokens_in || 0) + (finished.tokens_out || 0)} tokens · ${money(finished.cost_usd)}`
+    : finished.status;
+  t.el.appendChild(f);
+}
+
+function pauseTurn(t, text) {
+  addRow(t, text);
+  t.activity.open = false;
+  setRunning(false);
+  refreshMeta();
 }
 
 function handleEvent(t, type, evt) {
   t.depthHint = evt.depth || 0;
   const who = agentTag(evt);
+  const root = !evt.depth;
   switch (type) {
-    case "text": appendText(t, evt.delta); break;
-    case "reasoning": addRow(t, `💭 ${esc(evt.delta)}`); break;
+    case "text": if (root) { appendText(t, evt.delta); t.streamed = true; t.hasText = true; } break;
+    case "reasoning": if (root) addRow(t, `💭 ${esc(evt.delta)}`); break;
+    case "assistant_message":
+      if (!root) break;
+      if (t.text && t.streamed) { t.buffer = evt.content; t.text.innerHTML = markdown(evt.content); }
+      else appendText(t, evt.content);
+      t.text = null; t.streamed = false; t.hasText = true;
+      break;
     case "thinking": addRow(t, `${who}💭 ${esc(evt.thought)}`); break;
     case "plan_updated": renderPlan(t, evt.steps || []); break;
     case "tools_loaded": addRow(t, `${who}🔎 descobriu: ${esc((evt.tools || []).join(", ") || "nada novo")}`); break;
@@ -317,7 +354,7 @@ function handleEvent(t, type, evt) {
     case "approval_request": renderApproval(t, evt); break;
     case "budget_exceeded": addRow(t, `${who}budget esgotado (${evt.used}/${evt.limit})`, "fail"); break;
     case "error": addRow(t, `${who}erro: ${esc(evt.message)}`, "fail"); break;
-    case "cancelled": addRow(t, `${who}cancelado`, "fail"); break;
+    case "cancelled": addRow(t, `${who}cancelado ${esc(evt.reason || "")}`, "fail"); break;
     case "llm_call": state.liveTokens += (evt.input_tokens || 0) + (evt.output_tokens || 0); state.liveCost += Number(evt.cost_usd || 0); renderStats(); break;
     case "tool_call":
       if (SILENT_TOOLS.has(evt.name)) break;
@@ -331,24 +368,45 @@ function handleEvent(t, type, evt) {
       row.querySelector(".st").innerHTML = `${evt.ok ? "✓" : "✗"} ${evt.ms}ms <details><summary>resultado</summary><pre>${esc(evt.output)}</pre></details>`;
       break;
     }
-    case "waiting_human": break;
-    case "run_resumed": addRow(t, "▶ retomado com a sua decisão"); break;
-    case "done":
-      if (evt.status === "waiting_human") {
-        addRow(t, "⏸ pausado esperando a sua decisão acima");
-        t.activity.open = false;
-        break;
-      }
-      for (const actions of t.el.querySelectorAll(".approval .actions")) {
-        if (actions.querySelector("button")) actions.textContent = "Sem decisão: o turno terminou.";
-      }
-      if (!t.buffer && evt.output) appendText(t, evt.output);
-      if (evt.status !== "completed") addRow(t, `turno terminou como <b>${esc(evt.status)}</b>`, "fail");
-      t.activity.open = false;
-      { const f = document.createElement("div"); f.className = "footer"; f.textContent = `${evt.status} · ${evt.steps} passos · ${evt.tokens} tokens · ${money(evt.cost_usd)}`; t.el.appendChild(f); }
+    case "waiting_human":
+      if (root) pauseTurn(t, "⏸ pausado esperando a sua decisão");
+      else addRow(t, `${who}⏸ esperando uma pessoa`);
       break;
-    case "failed": addRow(t, `<span class="error">${esc(evt.error)}</span>`, "fail"); break;
+    case "waiting_child":
+      if (root) pauseTurn(t, `⏸ pausado: o subagente <b>${esc(evt.child_agent)}</b> espera a sua decisão`);
+      else addRow(t, `${who}⏸ esperando o subagente ${esc(evt.child_agent)}`);
+      break;
+    case "run_resumed":
+      addRow(t, `${who}▶ retomado por <code>${esc(evt.by)}</code>`);
+      setRunning(true);
+      break;
+    case "run_finished":
+      if (!root) break;
+      closeTurn(t, evt);
+      state.turn = null;
+      setRunning(false);
+      refreshMeta();
+      break;
+    case "failed": addRow(t, `<span class="error">${esc(evt.error)}</span>`, "fail"); setRunning(false); break;
   }
+}
+
+const STREAM_EVENTS = ["text", "reasoning", "assistant_message", "thinking", "plan_updated", "tools_loaded", "delegation_start",
+  "delegation_end", "task_created", "policy", "approval_request", "budget_exceeded", "error", "cancelled", "llm_call", "tool_call",
+  "tool_result", "waiting_human", "waiting_child", "run_resumed", "run_finished"];
+
+function currentTurn() {
+  if (!state.turn) state.turn = newTurn();
+  return state.turn;
+}
+
+/** Um stream por conversa, vindo de run_events: mostra o turno andando mesmo se outra instancia o retomar. */
+function subscribe(id, afterId) {
+  state.stream?.close();
+  const stream = new EventSource(`/api/conversations/${id}/stream?after=${afterId}`);
+  for (const type of STREAM_EVENTS)
+    stream.addEventListener(type, e => { if (state.conv === id) handleEvent(currentTurn(), type, JSON.parse(e.data)); });
+  state.stream = stream;
 }
 
 // ---------- historico persistido ----------
@@ -356,6 +414,7 @@ function handleEvent(t, type, evt) {
 function renderHistory(conv) {
   const inner = $("inner");
   inner.innerHTML = "";
+  state.cards = new Map();
   if (conv.summary) inner.insertAdjacentHTML("beforeend", `<details class="activity"><summary>Resumo dos turnos antigos (compactados)</summary><div class="rows"><div class="text">${markdown(conv.summary)}</div></div></details>`);
   let t = null;
   const results = new Map(conv.messages.filter(m => m.role === "tool").map(m => [m.tool_call_id, m]));
@@ -369,29 +428,20 @@ function renderHistory(conv) {
       for (const c of m.tool_calls || []) {
         const r = results.get(c.id);
         const ok = r && !/^(ERRO|NEGADO|BLOQUEADO|CANCELADO|INTERROMPIDO)/.test(r.content || "");
-        addRow(t, `⚙ <span class="name">${esc(c.name)}</span>(${esc(c.arguments).slice(0, 300)}) <span class="st">${r ? (ok ? "✓" : "✗") : ""} <details><summary>resultado</summary><pre>${esc(r?.content)}</pre></details></span>`, ok ? "ok" : "fail");
+        addRow(t, `⚙ <span class="name">${esc(c.name)}</span>(${esc(c.arguments).slice(0, 300)}) <span class="st">${r ? (ok ? "✓" : "✗") : "…"} <details><summary>resultado</summary><pre>${esc(r?.content)}</pre></details></span>`, ok ? "ok" : "fail");
         if (c.name === "update_plan") { try { renderPlan(t, JSON.parse(c.arguments).steps || []); } catch { } }
       }
       if (m.content) appendText(t, m.content);
     }
   }
   if (!t && !conv.messages.length) inner.innerHTML = `<div class="empty">Conversa nova com <b>${esc(conv.agent)}</b>. Pergunte qualquer coisa.</div>`;
-  for (const p of conv.pending_approvals || []) renderApproval(null, { ...p, depth: 0 });
-  if (conv.busy) inner.insertAdjacentHTML("beforeend", `<div class="banner">Um turno ainda está rodando no servidor. Atualizando…</div>`);
-  else if (conv.waiting?.ready_to_resume) {
-    inner.insertAdjacentHTML("beforeend", `<div class="banner">A decisão já foi tomada e o turno está pronto para continuar.<button class="primary" id="resumeBtn">Continuar</button></div>`);
-    $("resumeBtn").onclick = async e => {
-      if (!realClick(e)) return;
-      e.target.closest(".banner").remove();
-      await runStream(await fetch(`/api/conversations/${conv.id}/resume`, { method: "POST" }));
-    };
-  }
+  for (const p of conv.pending_approvals || []) renderApproval(null, p);
   updatePlaceholder(conv);
   scrollDown();
 }
 
 function updatePlaceholder(conv) {
-  $("input").placeholder = (conv.pending_approvals || []).some(p => p.durable)
+  $("input").placeholder = (conv.pending_approvals || []).length
     ? "Decida o pedido acima, ou envie outra mensagem para descartá-lo"
     : "Mensagem (Enter envia, Shift+Enter quebra linha)";
 }
@@ -402,68 +452,46 @@ function renderStats() {
   $("stats").textContent = `${c.agent} · ${(c.tokens + state.liveTokens).toLocaleString("pt-BR")} tokens · ${money(c.cost_usd + state.liveCost)} · ${c.active_tools.length} tools ativas`;
 }
 
+async function refreshMeta() {
+  const id = state.conv;
+  const conv = await api(`/api/conversations/${id}`);
+  if (state.conv !== id) return;
+  state.convData = conv;
+  state.liveTokens = 0; state.liveCost = 0;
+  $("title").textContent = conv.title || "Nova conversa";
+  renderStats();
+  updatePlaceholder(conv);
+  loadConversations();
+}
+
 async function openConversation(id) {
   state.conv = id;
+  state.turn = null;
   state.liveTokens = 0; state.liveCost = 0;
   const conv = await api(`/api/conversations/${id}`);
   state.convData = conv;
   $("title").textContent = conv.title || "Nova conversa";
   renderStats();
   renderHistory(conv);
-  setRunning(conv.busy);
+  const moving = conv.root_status === "running" || conv.root_status === "ready";
+  if (moving) addRow(currentTurn(), "⟳ turno em andamento no servidor");
+  setRunning(moving);
+  subscribe(id, conv.last_event_id);
   $("sidebar").classList.remove("open");
   await loadConversations();
-  if (conv.busy) setTimeout(() => state.conv === id && openConversation(id), 2000);
-  else $("input").focus();
+  if (!moving) $("input").focus();
 }
 
 async function send(text) {
   $("inner").querySelector(".empty")?.remove();
   $("inner").insertAdjacentHTML("beforeend", `<div class="user">${esc(text)}</div>`);
   updatePlaceholder({});
-  await runStream(fetch(`/api/conversations/${state.conv}/messages`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text })
-  }));
-}
-
-/** Consome um turno em SSE (mensagem nova, decisao que retoma o turno ou botao Continuar). */
-async function runStream(respOrPromise) {
-  const id = state.conv;
-  const t = newTurn();
+  state.turn = newTurn();
   setRunning(true);
-  try {
-    const resp = await respOrPromise;
-    if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || `HTTP ${resp.status}`);
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let sep;
-      while ((sep = buf.indexOf("\n\n")) >= 0) {
-        const block = buf.slice(0, sep);
-        buf = buf.slice(sep + 2);
-        const type = (block.match(/^event: (.*)$/m) || [])[1];
-        const data = (block.match(/^data: (.*)$/m) || [])[1];
-        if (type && data) handleEvent(t, type, JSON.parse(data));
-      }
-    }
-  } catch (e) {
-    handleEvent(t, "failed", { error: e.message });
-  } finally {
-    setRunning(false);
-    if (state.conv === id) {
-      state.convData = await api(`/api/conversations/${id}`);
-      state.liveTokens = 0; state.liveCost = 0;
-      $("title").textContent = state.convData.title || "Nova conversa";
-      renderStats();
-      updatePlaceholder(state.convData);
-      loadConversations();
-      $("input").focus();
-    }
-  }
+  const resp = await fetch(`/api/conversations/${state.conv}/messages`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text })
+  });
+  if (!resp.ok) handleEvent(state.turn, "failed", { error: (await resp.json().catch(() => ({}))).error || `HTTP ${resp.status}` });
 }
 
 function scrollDown() { const m = $("messages"); m.scrollTop = m.scrollHeight; }

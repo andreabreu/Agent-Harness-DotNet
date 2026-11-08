@@ -81,7 +81,7 @@ create table if not exists runs (
     output         text,
     conversation_id uuid,
     status         text not null default 'running'
-                   check (status in ('running', 'completed', 'failed', 'budget_exceeded', 'max_steps', 'cancelled', 'waiting_human')),
+                   check (status in ('running', 'completed', 'failed', 'budget_exceeded', 'max_steps', 'cancelled', 'waiting_human', 'waiting_child', 'ready')),
     depth          int not null default 0,
     steps          int not null default 0,
     tokens_in      bigint not null default 0,
@@ -93,7 +93,13 @@ create table if not exists runs (
 alter table runs add column if not exists conversation_id uuid;
 alter table runs drop constraint if exists runs_status_check;
 alter table runs add constraint runs_status_check
-    check (status in ('running', 'completed', 'failed', 'budget_exceeded', 'max_steps', 'cancelled', 'waiting_human'));
+    check (status in ('running', 'completed', 'failed', 'budget_exceeded', 'max_steps', 'cancelled', 'waiting_human', 'waiting_child', 'ready'));
+alter table runs add column if not exists waiting_on_run_id uuid;      -- waiting_child: o filho que suspendeu
+alter table runs add column if not exists pending_tool_call_id text;   -- tool call que recebe o resultado na retomada
+alter table runs add column if not exists budget_limit bigint;         -- limite efetivo do run (o filho herda uma fatia do pai)
+alter table runs add column if not exists active_tools text[];         -- ferramentas carregadas ao suspender (descobertas incluidas)
+create index if not exists ix_runs_ready on runs(started_at) where status = 'ready';
+create index if not exists ix_runs_waiting_on on runs(waiting_on_run_id) where waiting_on_run_id is not null;
 create index if not exists ix_runs_root on runs(root_run_id);
 create index if not exists ix_runs_conversation on runs(conversation_id) where conversation_id is not null;
 create index if not exists ix_runs_parent on runs(parent_run_id);
@@ -107,6 +113,20 @@ create table if not exists run_events (
     created_at  timestamptz not null default clock_timestamp()
 );
 create index if not exists ix_run_events_run on run_events(run_id, seq);
+
+-- historico de mensagens dos runs que nao sao o agente raiz de uma conversa (subagentes, tarefas da fila,
+-- nos de workflow): e o que permite retomar qualquer run suspenso a partir do banco
+create table if not exists run_messages (
+    run_id        uuid not null references runs(id) on delete cascade,
+    seq           int not null,
+    role          text not null check (role in ('user', 'assistant', 'tool')),
+    content       text,
+    tool_calls    jsonb,
+    tool_call_id  text,
+    tool_name     text,
+    created_at    timestamptz not null default clock_timestamp(),
+    primary key (run_id, seq)
+);
 
 -- fila de tarefas assincronas (delegacao estilo ticket)
 create table if not exists tasks (
@@ -244,3 +264,5 @@ alter table approvals add constraint approvals_status_check
     check (status in ('pending', 'approved', 'denied', 'answered', 'expired'));
 create index if not exists ix_approvals_pending on approvals(conversation_id) where status = 'pending';
 create index if not exists ix_approvals_call on approvals(run_id, tool_call_id);
+alter table approvals add column if not exists expires_at timestamptz;
+create index if not exists ix_approvals_expiring on approvals(expires_at) where status = 'pending';

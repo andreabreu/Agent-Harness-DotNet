@@ -84,6 +84,13 @@ public sealed class EventLog
             ("r", ctx.RunId), ("s", ctx.NextSeq()), ("t", type), ("d", data));
         ctx.Observer?.OnEvent(ctx, type, data);
     }
+
+    /// <summary>Evento para um run que nao esta executando agora (suspenso, cancelado ou recebendo o resultado de um filho).</summary>
+    public Task AddDetachedAsync(Guid runId, string type, JsonObject data) =>
+        _db.ExecAsync(
+            @"insert into run_events (run_id, seq, type, data)
+              select @r, coalesce(max(seq), 0) + 1, @t, @d from run_events where run_id = @r",
+            ("r", runId), ("t", type), ("d", data));
 }
 
 /// <summary>Recebe ao vivo os eventos de um run e dos seus subagentes (os mesmos gravados em run_events) e o texto em streaming.</summary>
@@ -105,13 +112,34 @@ public interface IHumanGate
 }
 
 /// <summary>
-/// O run deve parar e esperar uma pessoa sem segurar processo. O harness grava o estado (waiting_human)
-/// e o run e retomado depois, a partir do historico persistido, quando a decisao chegar.
+/// O run deve parar sem segurar processo. O harness grava o estado no banco e o despachante retoma o mesmo run
+/// depois, a partir do historico persistido. <see cref="ToolCallId"/> e a chamada que recebe o resultado na retomada.
 /// </summary>
-public sealed class HumanInputRequiredException : Exception
+public abstract class RunSuspendedException : Exception
+{
+    public string ToolCallId { get; }
+    protected RunSuspendedException(string toolCallId, string message) : base(message) => ToolCallId = toolCallId;
+}
+
+/// <summary>Uma pessoa precisa decidir (aprovacao ou ask_human); o pedido esta em approvals.</summary>
+public sealed class HumanInputRequiredException : RunSuspendedException
 {
     public Guid RequestId { get; }
-    public HumanInputRequiredException(Guid requestId, string what) : base($"Aguardando decisao humana: {what}") => RequestId = requestId;
+    public HumanInputRequiredException(Guid requestId, string toolCallId, string what)
+        : base(toolCallId, $"Aguardando decisao humana: {what}") => RequestId = requestId;
+}
+
+/// <summary>Um subagente suspendeu; o pai fica parado na chamada delegate_task ate o filho terminar.</summary>
+public sealed class ChildSuspendedException : RunSuspendedException
+{
+    public Guid ChildRunId { get; }
+    public string ChildAgent { get; }
+    public ChildSuspendedException(Guid childRunId, string childAgent, string toolCallId)
+        : base(toolCallId, $"Aguardando o subagente {childAgent} (run {Text.Short(childRunId)})")
+    {
+        ChildRunId = childRunId;
+        ChildAgent = childAgent;
+    }
 }
 
 public static class Approval
@@ -207,4 +235,7 @@ public sealed record RunResult(Guid RunId, Guid RootRunId, string Status, string
 
     /// <summary>Pedido humano que suspendeu o run (status waiting_human).</summary>
     public Guid? WaitingFor { get; init; }
+
+    /// <summary>Subagente em que o run ficou parado (status waiting_child).</summary>
+    public Guid? WaitingOnRun { get; init; }
 }

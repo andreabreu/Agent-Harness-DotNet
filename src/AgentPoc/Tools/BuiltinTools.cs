@@ -42,7 +42,7 @@ public sealed class BuiltinTools
         "update_plan" => UpdatePlan(args, ctx),
         "web_search" => WebSearchTool(args, ct),
         "list_agents" => ListAgents(ctx),
-        "delegate_task" => Delegate(args, ctx, ct),
+        "delegate_task" => Delegate(args, ctx, callId, ct),
         "create_task" => CreateTask(args, ctx),
         "check_task" => CheckTask(args),
         "memory_save" => MemorySave(args, ctx),
@@ -137,7 +137,7 @@ public sealed class BuiltinTools
         return null;
     }
 
-    private async Task<string> Delegate(JsonObject args, RunContext ctx, CancellationToken ct)
+    private async Task<string> Delegate(JsonObject args, RunContext ctx, string callId, CancellationToken ct)
     {
         var agentId = Arg(args, "agent");
         var task = Arg(args, "task");
@@ -147,6 +147,9 @@ public sealed class BuiltinTools
 
         await _events.AddAsync(ctx, "delegation_start", new JsonObject { ["to_agent"] = agentId, ["task"] = Text.Trunc(task, 1500) });
         var child = await Runner.RunAsync(agentId, task, parent: ctx, ct: ct);
+        if (RunStatus.IsSuspended(child.Status))
+            throw new ChildSuspendedException(child.RunId, agentId, callId);
+
         await _events.AddAsync(ctx, "delegation_end", new JsonObject
         {
             ["to_agent"] = agentId,
@@ -154,7 +157,7 @@ public sealed class BuiltinTools
             ["status"] = child.Status,
             ["tokens"] = child.TokensIn + child.TokensOut
         });
-        return $"[resultado de {agentId} | status={child.Status} | passos={child.Steps}]\n{Text.Trunc(child.Output, 6000)}";
+        return DelegationResult.Format(agentId, child.Status, child.Steps, child.Output);
     }
 
     private async Task<string> CreateTask(JsonObject args, RunContext ctx)

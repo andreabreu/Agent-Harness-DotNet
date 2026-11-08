@@ -89,7 +89,7 @@ public sealed class ToolExecutor
         {
             throw;
         }
-        catch (HumanInputRequiredException)
+        catch (RunSuspendedException)
         {
             throw;
         }

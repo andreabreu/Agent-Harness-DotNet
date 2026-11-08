@@ -1,5 +1,6 @@
 using System.Text.Json.Nodes;
 using AgentPoc.Core;
+using AgentPoc.Harness;
 using AgentPoc.Llm;
 
 namespace AgentPoc.Chat;
@@ -13,7 +14,7 @@ public sealed record StoredMessage(int Seq, ChatMessage Message, Guid? RunId, Da
 public sealed record TaskNotice(Guid TaskId, string Agent, string Status, string? Result, string? Error);
 
 /// <summary>Persistencia das conversas e mensagens do chat no Postgres.</summary>
-public sealed class ConversationStore
+public sealed class ConversationStore : IConversationHistory
 {
     private readonly Db _db;
     public ConversationStore(Db db) => _db = db;
@@ -45,7 +46,7 @@ public sealed class ConversationStore
             @"select seq, role, content, tool_calls::text as tool_calls, tool_call_id, tool_name, run_id, created_at
                 from conversation_messages where conversation_id = @c and seq > @s order by seq",
             ("c", conversationId), ("s", afterSeq)))
-        .Select(r => new StoredMessage(r.I("seq"), MapMessage(r), r.GN("run_id"), r.T("created_at")))
+        .Select(r => new StoredMessage(r.I("seq"), RunMessageStore.MapMessage(r), r.GN("run_id"), r.T("created_at")))
         .ToList();
 
     public async Task<int> AppendAsync(Guid conversationId, Guid runId, ChatMessage m)
@@ -55,11 +56,17 @@ public sealed class ConversationStore
               select @c, coalesce(max(seq), 0) + 1, @role, @content, @calls, @callId, @tool, @run
                 from conversation_messages where conversation_id = @c
               returning seq",
-            ("c", conversationId), ("role", m.Role), ("content", m.Content), ("calls", ToolCallsJson(m.ToolCalls)),
+            ("c", conversationId), ("role", m.Role), ("content", m.Content), ("calls", RunMessageStore.ToolCallsJson(m.ToolCalls)),
             ("callId", m.ToolCallId), ("tool", m.ToolName), ("run", runId));
         await _db.ExecAsync("update conversations set updated_at = now() where id = @c", ("c", conversationId));
         return Convert.ToInt32(seq);
     }
+
+    Task IConversationHistory.AppendAsync(Guid conversationId, Guid runId, ChatMessage message) => AppendAsync(conversationId, runId, message);
+
+    public Task UpdateActiveToolsAsync(Guid conversationId, IEnumerable<string> activeTools) =>
+        _db.ExecAsync("update conversations set active_tools = @t, updated_at = now() where id = @c",
+            ("t", activeTools.OrderBy(t => t).ToArray()), ("c", conversationId));
 
     public Task UpdateAfterTurnAsync(Guid conversationId, IEnumerable<string> activeTools, string firstUserText) =>
         _db.ExecAsync(
@@ -81,41 +88,27 @@ public sealed class ConversationStore
         .Select(r => new TaskNotice(r.G("id"), r.S("agent_id"), r.S("status"), r.SN("result"), r.SN("error")))
         .ToList();
 
-    /// <summary>Run raiz da conversa suspenso esperando uma pessoa (no maximo um por vez).</summary>
-    public async Task<Guid?> WaitingRunAsync(Guid conversationId) =>
-        await _db.ScalarAsync(
-            @"select id from runs where conversation_id = @c and depth = 0 and status = 'waiting_human'
-               order by started_at desc limit 1", ("c", conversationId)) as Guid?;
+    /// <summary>Run raiz do turno mais recente da conversa, com o status atual.</summary>
+    public async Task<(Guid RunId, string Status)?> LatestRootRunAsync(Guid conversationId)
+    {
+        var r = await _db.QueryOneAsync(
+            "select id, status from runs where conversation_id = @c and depth = 0 order by started_at desc limit 1", ("c", conversationId));
+        return r == null ? null : (r.G("id"), r.S("status"));
+    }
 
-    public Task CloseRunAsync(Guid runId, string status, string output) =>
-        _db.ExecAsync("update runs set status = @s, output = @o, finished_at = now() where id = @id",
-            ("s", status), ("o", output), ("id", runId));
+    /// <summary>
+    /// Historico para retomar o agente raiz da conversa: as tool calls pendentes da ultima mensagem continuam
+    /// sem resultado, para a retomada executa-las; as mensagens novas continuam sendo gravadas na conversa.
+    /// </summary>
+    public async Task<ChatTurn> ResumeTurnAsync(Guid conversationId, IReadOnlyCollection<string> activeTools)
+    {
+        var conv = await GetAsync(conversationId) ?? throw new InvalidOperationException($"Conversa {conversationId} nao encontrada.");
+        var stored = await LoadMessagesAsync(conv.Id, conv.SummarizedUpto);
+        var history = ChatHistory.Repair(stored.Select(m => m.Message).ToList(), keepTrailingPending: true);
+        return new ChatTurn(conv.Id, history, activeTools, conv.Summary, null, (runId, message) => AppendAsync(conv.Id, runId, message));
+    }
 
     private static Conversation Map(Dictionary<string, object?> r) => new(
         r.G("id"), r.S("agent_id"), r.SN("title"), r.A("active_tools"), r.SN("summary"), r.I("summarized_upto"),
         r.T("created_at"), r.T("updated_at"));
-
-    private static ChatMessage MapMessage(Dictionary<string, object?> r) => new()
-    {
-        Role = r.S("role"),
-        Content = r.SN("content"),
-        ToolCalls = ParseToolCalls(r.SN("tool_calls")),
-        ToolCallId = r.SN("tool_call_id"),
-        ToolName = r.SN("tool_name")
-    };
-
-    private static Jsonb? ToolCallsJson(List<ToolCall>? calls)
-    {
-        if (calls is not { Count: > 0 }) return null;
-        var arr = new JsonArray();
-        foreach (var c in calls) arr.Add(new JsonObject { ["id"] = c.Id, ["name"] = c.Name, ["arguments"] = c.ArgumentsJson });
-        return new Jsonb(arr.ToJsonString());
-    }
-
-    private static List<ToolCall>? ParseToolCalls(string? json)
-    {
-        if (string.IsNullOrEmpty(json) || JsonNode.Parse(json) is not JsonArray arr || arr.Count == 0) return null;
-        return arr.Select(c => new ToolCall(
-            c?["id"]?.GetValue<string>() ?? "", c?["name"]?.GetValue<string>() ?? "", c?["arguments"]?.GetValue<string>() ?? "{}")).ToList();
-    }
 }

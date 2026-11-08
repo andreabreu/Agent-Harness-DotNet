@@ -19,14 +19,19 @@ public sealed class AgentRunner
     private readonly ToolRegistry _registry;
     private readonly ToolExecutor _executor;
     private readonly EventLog _events;
+    private readonly RunMessageStore _messages;
+    private readonly IRunLifecycle _lifecycle;
 
-    public AgentRunner(Db db, ConfigRepo config, ToolRegistry registry, ToolExecutor executor, EventLog events)
+    public AgentRunner(Db db, ConfigRepo config, ToolRegistry registry, ToolExecutor executor, EventLog events,
+                       RunMessageStore messages, IRunLifecycle lifecycle)
     {
         _db = db;
         _config = config;
         _registry = registry;
         _executor = executor;
         _events = events;
+        _messages = messages;
+        _lifecycle = lifecycle;
     }
 
     private static JsonArray ToArray(IEnumerable<string> items)
@@ -38,9 +43,10 @@ public sealed class AgentRunner
 
     /// <param name="chat">Continuacao de conversa: historico, ferramentas ja descobertas e persistencia de cada mensagem nova.</param>
     /// <param name="hooks">Observer ao vivo e quem responde pelo humano; quando nulos, herda do pai ou usa o padrao da CLI.</param>
+    /// <param name="runId">Id do run definido por quem chama (para registrar a execucao antes de comecar).</param>
     public async Task<RunResult> RunAsync(string agentId, string input, RunContext? parent = null, Guid? workflowRunId = null,
                                           long? budgetOverride = null, ChatTurn? chat = null, RunHooks? hooks = null,
-                                          CancellationToken ct = default)
+                                          Guid? runId = null, CancellationToken ct = default)
     {
         var agent = await _config.GetAgentAsync(agentId)
                     ?? throw new InvalidOperationException($"Agente '{agentId}' nao existe ou esta desabilitado.");
@@ -48,20 +54,20 @@ public sealed class AgentRunner
         var depth = parent == null ? 0 : parent.Depth + 1;
         var limit = budgetOverride ?? agent.MaxTokens;
         var budget = parent == null ? new Budget(limit) : parent.Budget.Child(limit);
-        var runId = Guid.NewGuid();
-        var rootId = parent?.RootRunId ?? runId;
+        var id = runId ?? Guid.NewGuid();
+        var rootId = parent?.RootRunId ?? id;
         var wfRun = workflowRunId ?? parent?.WorkflowRunId;
         var conversationId = chat?.ConversationId ?? parent?.ConversationId;
 
         await _db.ExecAsync(
-            @"insert into runs (id, parent_run_id, root_run_id, workflow_run_id, conversation_id, agent_id, agent_version, model_id, input, depth)
-              values (@id, @p, @root, @wf, @conv, @a, @v, @m, @i, @d)",
-            ("id", runId), ("p", parent?.RunId), ("root", rootId), ("wf", wfRun), ("conv", conversationId), ("a", agent.Id),
-            ("v", agent.Version), ("m", model.Id), ("i", input), ("d", depth));
+            @"insert into runs (id, parent_run_id, root_run_id, workflow_run_id, conversation_id, agent_id, agent_version, model_id, input, depth, budget_limit)
+              values (@id, @p, @root, @wf, @conv, @a, @v, @m, @i, @d, @b)",
+            ("id", id), ("p", parent?.RunId), ("root", rootId), ("wf", wfRun), ("conv", conversationId), ("a", agent.Id),
+            ("v", agent.Version), ("m", model.Id), ("i", input), ("d", depth), ("b", budget.Limit));
 
         var ctx = new RunContext
         {
-            RunId = runId,
+            RunId = id,
             ParentRunId = parent?.RunId,
             RootRunId = rootId,
             WorkflowRunId = wfRun,
@@ -89,51 +95,57 @@ public sealed class AgentRunner
             ["initial_tools"] = ToArray(ctx.ActiveTools.Keys.OrderBy(k => k)),
             ["input"] = Text.Trunc(input, 3000)
         });
-        Log.Write(depth, ConsoleColor.Magenta, "agente", $"{agent.Id} v{agent.Version} iniciou run {Text.Short(runId)} | modelo {model.Id} ({model.ResolvedName}) | budget {budget.Remaining:N0} tokens");
+        Log.Write(depth, ConsoleColor.Magenta, "agente", $"{agent.Id} v{agent.Version} iniciou run {Text.Short(id)} | modelo {model.Id} ({model.ResolvedName}) | budget {budget.Remaining:N0} tokens");
         Log.Write(depth, ConsoleColor.Gray, "entrada", input);
 
-        var loop = new LoopState(ctx, chat);
+        var loop = new LoopState(ctx, chat, chat?.History ?? Array.Empty<ChatMessage>(), _messages);
         await loop.AppendAsync(ChatMessage.User(input));
         return await RunLoopAsync(loop, Array.Empty<ToolCall>(), ct);
     }
 
     /// <summary>
-    /// Retoma um run suspenso em waiting_human (mesmo run, mesmos contadores). Primeiro conclui as tool calls que
-    /// ficaram sem resultado, agora com a decisao humana gravada, e depois segue o loop normal do agente.
+    /// Retoma um run que o despachante ja marcou como running (mesmo run, mesmos contadores e budget).
+    /// O historico vem da conversa (agente raiz do chat) ou de run_messages (subagentes e demais runs). Primeiro
+    /// conclui as tool calls que ficaram sem resultado (a decisao humana ja esta gravada) e segue o loop normal.
     /// </summary>
-    public async Task<RunResult> ResumeAsync(Guid runId, ChatTurn chat, RunHooks hooks, CancellationToken ct)
+    public async Task<RunResult> ResumeAsync(Guid runId, ChatTurn? chat, RunHooks hooks, string resumedBy, CancellationToken ct)
     {
         var run = await _db.QueryOneAsync("select * from runs where id = @id", ("id", runId))
                   ?? throw new InvalidOperationException($"Run {runId} nao encontrado.");
-        if (run.S("status") != "waiting_human")
-            throw new InvalidOperationException($"Run {Text.Short(runId)} nao esta aguardando decisao humana (status {run.S("status")}).");
+        if (run.S("status") != RunStatus.Running)
+            throw new InvalidOperationException($"Run {Text.Short(runId)} precisa ser reivindicado antes de retomar (status {run.S("status")}).");
         var agent = await _config.GetAgentAsync(run.S("agent_id"))
                     ?? throw new InvalidOperationException($"Agente '{run.S("agent_id")}' nao existe ou esta desabilitado.");
         var model = await _config.GetModelAsync(agent.ModelId);
         var lastSeq = Convert.ToInt32(await _db.ScalarAsync("select coalesce(max(seq), 0) from run_events where run_id = @id", ("id", runId)));
 
-        var budget = new Budget(agent.MaxTokens);
-        budget.Consume(run.L("tokens_in") + run.L("tokens_out"));
+        var budget = new Budget(run.SN("budget_limit") is { } limit ? long.Parse(limit) : agent.MaxTokens);
+        budget.Consume(await SubtreeTokensAsync(runId));
+        var depth = run.I("depth");
         var ctx = new RunContext
         {
             RunId = runId,
+            ParentRunId = run.GN("parent_run_id"),
             RootRunId = run.G("root_run_id"),
-            ConversationId = chat.ConversationId,
+            WorkflowRunId = run.GN("workflow_run_id"),
+            ConversationId = run.GN("conversation_id"),
             Agent = agent,
             Model = model,
-            Depth = 0,
+            Depth = depth,
             Budget = budget,
             Observer = hooks.Observer,
             Human = hooks.Human ?? ModeHumanGate.Instance,
             SeqStart = lastSeq
         };
-        foreach (var t in (await _registry.LoadAsync(ToolsToLoad(agent, chat))).Values) ctx.ActiveTools[t.Name] = t;
+        var activeTools = run.A("active_tools");
+        foreach (var t in (await _registry.LoadAsync(agent.InitialTools.Concat(activeTools.Where(t => Glob.Match(agent.AllowedTools, t))))).Values)
+            ctx.ActiveTools[t.Name] = t;
 
-        await _db.ExecAsync("update runs set status = 'running' where id = @id", ("id", runId));
-        await _events.AddAsync(ctx, "run_resumed", new JsonObject { ["after_steps"] = run.I("steps") });
-        Log.Write(0, ConsoleColor.Magenta, "agente", $"{agent.Id} retomou run {Text.Short(runId)} apos decisao humana");
+        await _events.AddAsync(ctx, "run_resumed", new JsonObject { ["after_steps"] = run.I("steps"), ["by"] = resumedBy });
+        Log.Write(depth, ConsoleColor.Magenta, "agente", $"{agent.Id} retomou run {Text.Short(runId)} ({resumedBy})");
 
-        var loop = new LoopState(ctx, chat)
+        var history = chat?.History ?? await _messages.LoadAsync(runId);
+        var loop = new LoopState(ctx, chat, history, _messages)
         {
             Steps = run.I("steps"),
             TokensIn = run.L("tokens_in"),
@@ -143,16 +155,27 @@ public sealed class AgentRunner
         return await RunLoopAsync(loop, UnansweredToolCalls(loop.Messages).ToList(), ct);
     }
 
-    /// <summary>Estado mutavel de um run em execucao (mensagens e contadores).</summary>
+    /// <summary>Tokens ja gastos pelo run e por todos os subagentes dele (o budget do pai inclui os filhos).</summary>
+    private async Task<long> SubtreeTokensAsync(Guid runId) =>
+        Convert.ToInt64(await _db.ScalarAsync(
+            @"with recursive tree as (
+                  select id from runs where id = @id
+                  union all
+                  select r.id from runs r join tree t on r.parent_run_id = t.id)
+              select coalesce(sum(tokens_in + tokens_out), 0) from runs where id in (select id from tree)", ("id", runId)));
+
+    /// <summary>Estado mutavel de um run em execucao (mensagens e contadores). Cada mensagem nova e persistida.</summary>
     private sealed class LoopState
     {
         private readonly ChatTurn? _chat;
+        private readonly RunMessageStore _store;
 
-        public LoopState(RunContext ctx, ChatTurn? chat)
+        public LoopState(RunContext ctx, ChatTurn? chat, IEnumerable<ChatMessage> history, RunMessageStore store)
         {
             Ctx = ctx;
             _chat = chat;
-            Messages = new List<ChatMessage>(chat?.History ?? Array.Empty<ChatMessage>());
+            _store = store;
+            Messages = new List<ChatMessage>(history);
         }
 
         public RunContext Ctx { get; }
@@ -167,6 +190,7 @@ public sealed class AgentRunner
         {
             Messages.Add(message);
             if (_chat != null) await _chat.OnMessage(Ctx.RunId, message);
+            else await _store.AppendAsync(Ctx.RunId, message);
         }
     }
 
@@ -176,9 +200,9 @@ public sealed class AgentRunner
         var agent = ctx.Agent;
         var model = ctx.Model;
         var depth = ctx.Depth;
-        var status = "running";
+        var status = RunStatus.Running;
         var output = "";
-        Guid? waitingFor = null;
+        RunSuspendedException? suspension = null;
         var client = LlmFactory.For(model);
         var stream = StreamFor(ctx);
 
@@ -248,6 +272,8 @@ public sealed class AgentRunner
                     Log.Write(depth, ConsoleColor.DarkCyan, "pensa", resp.Content);
 
                 await loop.AppendAsync(ChatMessage.Assistant(resp.Content, resp.ToolCalls.Count > 0 ? resp.ToolCalls : null));
+                if (!string.IsNullOrEmpty(resp.Content))
+                    await _events.AddAsync(ctx, "assistant_message", new JsonObject { ["content"] = resp.Content });
 
                 if (resp.ToolCalls.Count == 0)
                 {
@@ -260,13 +286,20 @@ public sealed class AgentRunner
                     await loop.AppendAsync(ChatMessage.Tool(call.Id, call.Name, await _executor.ExecuteAsync(ctx, call, ct)));
             }
         }
-        catch (HumanInputRequiredException waiting)
+        catch (RunSuspendedException suspended)
         {
-            status = "waiting_human";
-            output = waiting.Message;
-            waitingFor = waiting.RequestId;
-            await _events.AddAsync(ctx, "waiting_human", new JsonObject { ["request_id"] = waiting.RequestId.ToString(), ["step"] = loop.Steps });
-            Log.Write(depth, ConsoleColor.Yellow, "aguardando", $"{agent.Id} run {Text.Short(ctx.RunId)}: {waiting.Message}");
+            suspension = suspended;
+            status = RunStatus.ForSuspension(suspended);
+            output = suspended.Message;
+            var data = new JsonObject { ["tool_call_id"] = suspended.ToolCallId, ["step"] = loop.Steps };
+            if (suspended is HumanInputRequiredException human) data["request_id"] = human.RequestId.ToString();
+            if (suspended is ChildSuspendedException child)
+            {
+                data["child_run_id"] = child.ChildRunId.ToString();
+                data["child_agent"] = child.ChildAgent;
+            }
+            await _events.AddAsync(ctx, status, data);
+            Log.Write(depth, ConsoleColor.Yellow, "aguardando", $"{agent.Id} run {Text.Short(ctx.RunId)}: {suspended.Message}");
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -285,12 +318,16 @@ public sealed class AgentRunner
             Log.Write(depth, ConsoleColor.Red, "erro", $"{agent.Id}: {ex.Message}");
         }
 
+        var suspendedNow = suspension != null;
         await _db.ExecAsync(
             @"update runs set status = @st, output = @o, steps = @s, tokens_in = @ti, tokens_out = @to, cost_usd = @c,
-                     finished_at = case when @st = 'waiting_human' then null else now() end
+                     waiting_on_run_id = @wait, pending_tool_call_id = @call, active_tools = @tools,
+                     finished_at = case when @suspended then null else now() end
                where id = @id",
-            ("st", status), ("o", output), ("s", loop.Steps), ("ti", loop.TokensIn), ("to", loop.TokensOut), ("c", loop.Cost), ("id", ctx.RunId));
-        if (status != "waiting_human")
+            ("st", status), ("o", output), ("s", loop.Steps), ("ti", loop.TokensIn), ("to", loop.TokensOut), ("c", loop.Cost),
+            ("wait", (suspension as ChildSuspendedException)?.ChildRunId), ("call", suspension?.ToolCallId),
+            ("tools", ctx.ActiveTools.Keys.OrderBy(k => k).ToArray()), ("suspended", suspendedNow), ("id", ctx.RunId));
+        if (!suspendedNow)
             await _events.AddAsync(ctx, "run_finished", new JsonObject
             {
                 ["status"] = status,
@@ -303,10 +340,14 @@ public sealed class AgentRunner
         Log.Write(depth, status == "completed" ? ConsoleColor.Green : ConsoleColor.Red, "fim",
             $"{agent.Id} run {Text.Short(ctx.RunId)}: {status} | {loop.Steps} passos | {loop.TokensIn + loop.TokensOut:N0} tokens | US$ {loop.Cost:0.0000}");
 
+        if (suspension != null) await _lifecycle.OnSuspendedAsync(ctx, suspension);
+        else await _lifecycle.OnFinishedAsync(ctx, status);
+
         return new RunResult(ctx.RunId, ctx.RootRunId, status, output, loop.TokensIn, loop.TokensOut, loop.Cost, loop.Steps)
         {
             ActiveTools = ctx.ActiveTools.Keys.ToArray(),
-            WaitingFor = waitingFor
+            WaitingFor = (suspension as HumanInputRequiredException)?.RequestId,
+            WaitingOnRun = (suspension as ChildSuspendedException)?.ChildRunId
         };
     }
 

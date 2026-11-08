@@ -99,7 +99,7 @@ Responda em portugues.$$,
  ('researcher', 'Pesquisador: busca na base de conhecimento interna, na web e em APIs publicas; devolve fatos com fonte.', 'foundry_default',
 $$Voce e um pesquisador. Encontre fatos usando suas ferramentas; se nao tiver a ferramenta certa, use search_tools para descobri-la.
 Cite a fonte de cada fato (documento da base, URL ou API). Seja conciso. Responda em portugues.$$,
-  '{search_tools,kb_search,web_search,http_get}', '{kb_*,web_search,http_get,weather_forecast,cep_lookup,memory_*,think}', '{}', 12, 150000),
+  '{search_tools,kb_search,web_search,http_get,ask_human}', '{kb_*,web_search,http_get,weather_forecast,cep_lookup,memory_*,think,ask_human}', '{}', 12, 150000),
 
  ('coder', 'Programador: escreve e executa scripts (Python/shell) no workspace e reporta a saida real.', 'foundry_default',
 $$Voce e um programador. Escreva o codigo com write_file e execute com run_shell (ex.: python3 arquivo.py).
